@@ -1,0 +1,25 @@
+{
+  "raw": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cDovLzEyNy4wLjAuMTozNjk0My9wL2pvYi9qLTAwMDEiLCJkZXNjcmlwdGlvbiI6ImNvbGxlY3QgYSBjb21wbGV0ZWQgam9iIiwibWltZVR5cGUiOiIifSwiYWNjZXB0cyI6W3sic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoiaGVkZXJhOnRlc3RuZXQiLCJhbW91bnQiOiI1MDAiLCJhc3NldCI6IjAuMC4wIiwicGF5VG8iOiIwLjAuMTAyMzYyNjEiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MTIwLCJleHRyYSI6eyJmZWVQYXllciI6IjAuMC43MTYyNzg0In19XX0=",
+  "decoded": {
+    "x402Version": 2,
+    "error": "Payment required",
+    "resource": {
+      "url": "http://127.0.0.1:36943/p/job/j-0001",
+      "description": "collect a completed job",
+      "mimeType": ""
+    },
+    "accepts": [
+      {
+        "scheme": "exact",
+        "network": "hedera:testnet",
+        "amount": "500",
+        "asset": "0.0.0",
+        "payTo": "0.0.10236261",
+        "maxTimeoutSeconds": 120,
+        "extra": {
+          "feePayer": "0.0.7162784"
+        }
+      }
+    ]
+  }
+}

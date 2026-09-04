@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+registry/registry
+dist/

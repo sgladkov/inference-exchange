@@ -1,0 +1,8 @@
+{
+  "success": true,
+  "transaction": "0.0.7162784@1788546765.327034331",
+  "errorReason": null,
+  "headers": {
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJwYXllciI6IjAuMC4xMDEyMzIyNCIsInRyYW5zYWN0aW9uIjoiMC4wLjcxNjI3ODRAMTc4ODU0Njc2NS4zMjcwMzQzMzEiLCJuZXR3b3JrIjoiaGVkZXJhOnRlc3RuZXQifQ=="
+  }
+}

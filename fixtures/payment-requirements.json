@@ -1,0 +1,11 @@
+{
+  "scheme": "exact",
+  "network": "hedera:testnet",
+  "amount": "500",
+  "asset": "0.0.0",
+  "payTo": "0.0.10236261",
+  "maxTimeoutSeconds": 120,
+  "extra": {
+    "feePayer": "0.0.7162784"
+  }
+}

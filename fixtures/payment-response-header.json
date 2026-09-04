@@ -1,0 +1,9 @@
+{
+  "raw": "eyJzdWNjZXNzIjp0cnVlLCJwYXllciI6IjAuMC4xMDEyMzIyNCIsInRyYW5zYWN0aW9uIjoiMC4wLjcxNjI3ODRAMTc4ODU0Njc2NS4zMjcwMzQzMzEiLCJuZXR3b3JrIjoiaGVkZXJhOnRlc3RuZXQifQ==",
+  "decoded": {
+    "success": true,
+    "payer": "0.0.10123224",
+    "transaction": "0.0.7162784@1788546765.327034331",
+    "network": "hedera:testnet"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "result": "SUCCESS",
+  "transaction_id": "0.0.7162784-1788546765-327034331",
+  "transfers": [
+    {
+      "account": "0.0.802",
+      "amount": 258113,
+      "is_approval": false
+    },
+    {
+      "account": "0.0.7162784",
+      "amount": -258113,
+      "is_approval": false
+    },
+    {
+      "account": "0.0.10123224",
+      "amount": -500,
+      "is_approval": false
+    },
+    {
+      "account": "0.0.10236261",
+      "amount": 500,
+      "is_approval": false
+    }
+  ]
+}

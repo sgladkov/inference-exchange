@@ -1,0 +1,146 @@
+[
+  {
+    "endpoint": "/supported",
+    "method": "GET",
+    "requestHeaders": {
+      "Content-Type": "application/json"
+    },
+    "requestBody": null,
+    "status": 200,
+    "responseBody": {
+      "kinds": [
+        {
+          "x402Version": 2,
+          "scheme": "exact",
+          "network": "eip155:80002"
+        },
+        {
+          "x402Version": 2,
+          "scheme": "exact",
+          "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+          "extra": {
+            "feePayer": "7B6Q2MvcJvNcy1A13wHmAzmmdo3L8DVriaXML7bvkojm"
+          }
+        },
+        {
+          "x402Version": 2,
+          "scheme": "exact",
+          "network": "hedera:testnet",
+          "extra": {
+            "feePayer": "0.0.7162784"
+          }
+        }
+      ],
+      "extensions": [],
+      "signers": {
+        "eip155:*": [
+          "0xDCF7D72C2eE049DE4269ac6AAf925F33efdA18de"
+        ],
+        "solana:*": [
+          "7B6Q2MvcJvNcy1A13wHmAzmmdo3L8DVriaXML7bvkojm"
+        ],
+        "hedera:*": [
+          "0.0.7162784"
+        ]
+      }
+    }
+  },
+  {
+    "endpoint": "/verify",
+    "method": "POST",
+    "requestHeaders": {
+      "Content-Type": "application/json"
+    },
+    "requestBody": {
+      "x402Version": 2,
+      "paymentPayload": {
+        "x402Version": 2,
+        "payload": {
+          "transaction": "CsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgGGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkBZdMWzqjVAJzwrPwWv4y/Bjp8FJQXbDMTNmrY4p1k6gWU1RtSLVtMU3EmHKtvaq6QDjUDZRA1Gusz3I6kOp2flCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgIGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAURkdRPAtsEW/1h31ovXnIyHYPfKg9n+E+W4Bjryub1iyZfJVGCjsrJ3RhV7TctoiGYJbBG9lMyyIHGa1V/kLyCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgJGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAYjKxMsev3RA/4iJ/lDjZwFRJOTbW5yyDfZx9NQ7c5Vi47cO4BNmQLrqWBi2kNkgGfJPmtXnxKmLxGyMfwFcVkCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgEGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkCi9FERS0abMp+UXtgMI46ER9VKm6tfxdSRY7EInA22hDf53ElpzbD2leiyb1XQCgoyWPY1ccSLkFmjPiZ2pOtICsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgFGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkDeLWavtBqkgiKUep/1iEptL/DS5jZQEuPfQg1m4ZapulYJYu//iWIoapqpEL4R5XgeA7KVSrj+E1od+qTuTwHiCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgDGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAVPriR1vAG4DUtcjIGgguYl+h+M2koJHb2J6Hqpjy+0hJS+VEbPL8M0/I3b6NGaVZmMJ+GY+8ZLAbbrL4vT4WyCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgHGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkD2eFY7Z1EOcDiYPyHFAmjV/94IJ/K9grROwND63ICLpmxA8Ys7wgw5d3Li+LrvTOGiGSxMvms+nBhqfId/wMDs"
+        },
+        "resource": {
+          "url": "http://127.0.0.1:36943/p/job/j-0001",
+          "description": "collect a completed job",
+          "mimeType": ""
+        },
+        "accepted": {
+          "scheme": "exact",
+          "network": "hedera:testnet",
+          "amount": "500",
+          "asset": "0.0.0",
+          "payTo": "0.0.10236261",
+          "maxTimeoutSeconds": 120,
+          "extra": {
+            "feePayer": "0.0.7162784"
+          }
+        }
+      },
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "hedera:testnet",
+        "amount": "500",
+        "asset": "0.0.0",
+        "payTo": "0.0.10236261",
+        "maxTimeoutSeconds": 120,
+        "extra": {
+          "feePayer": "0.0.7162784"
+        }
+      }
+    },
+    "status": 200,
+    "responseBody": {
+      "isValid": true,
+      "payer": "0.0.10123224"
+    }
+  },
+  {
+    "endpoint": "/settle",
+    "method": "POST",
+    "requestHeaders": {
+      "Content-Type": "application/json"
+    },
+    "requestBody": {
+      "x402Version": 2,
+      "paymentPayload": {
+        "x402Version": 2,
+        "payload": {
+          "transaction": "CsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgGGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkBZdMWzqjVAJzwrPwWv4y/Bjp8FJQXbDMTNmrY4p1k6gWU1RtSLVtMU3EmHKtvaq6QDjUDZRA1Gusz3I6kOp2flCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgIGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAURkdRPAtsEW/1h31ovXnIyHYPfKg9n+E+W4Bjryub1iyZfJVGCjsrJ3RhV7TctoiGYJbBG9lMyyIHGa1V/kLyCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgJGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAYjKxMsev3RA/4iJ/lDjZwFRJOTbW5yyDfZx9NQ7c5Vi47cO4BNmQLrqWBi2kNkgGfJPmtXnxKmLxGyMfwFcVkCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgEGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkCi9FERS0abMp+UXtgMI46ER9VKm6tfxdSRY7EInA22hDf53ElpzbD2leiyb1XQCgoyWPY1ccSLkFmjPiZ2pOtICsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgFGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkDeLWavtBqkgiKUep/1iEptL/DS5jZQEuPfQg1m4ZapulYJYu//iWIoapqpEL4R5XgeA7KVSrj+E1od+qTuTwHiCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgDGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkAVPriR1vAG4DUtcjIGgguYl+h+M2koJHb2J6Hqpjy+0hJS+VEbPL8M0/I3b6NGaVZmMJ+GY+8ZLAbbrL4vT4WyCsYBKsMBClgKGwoMCM2d7NQGENvL+JsBEgkIABAAGKCXtQMYABIGCAAQABgHGIDC1y8iAgh4MgByJgokChAKCQgAEAAY2O/pBBDnBxgAChAKCQgAEAAY5eLwBBDoBxgAEmcKZQohA2vEgAnL09X+mgqBgKg2Qkoll/Mw9SkhKnGTBbrf1V9KMkD2eFY7Z1EOcDiYPyHFAmjV/94IJ/K9grROwND63ICLpmxA8Ys7wgw5d3Li+LrvTOGiGSxMvms+nBhqfId/wMDs"
+        },
+        "resource": {
+          "url": "http://127.0.0.1:36943/p/job/j-0001",
+          "description": "collect a completed job",
+          "mimeType": ""
+        },
+        "accepted": {
+          "scheme": "exact",
+          "network": "hedera:testnet",
+          "amount": "500",
+          "asset": "0.0.0",
+          "payTo": "0.0.10236261",
+          "maxTimeoutSeconds": 120,
+          "extra": {
+            "feePayer": "0.0.7162784"
+          }
+        }
+      },
+      "paymentRequirements": {
+        "scheme": "exact",
+        "network": "hedera:testnet",
+        "amount": "500",
+        "asset": "0.0.0",
+        "payTo": "0.0.10236261",
+        "maxTimeoutSeconds": 120,
+        "extra": {
+          "feePayer": "0.0.7162784"
+        }
+      }
+    },
+    "status": 200,
+    "responseBody": {
+      "success": true,
+      "transaction": "0.0.7162784@1788546765.327034331",
+      "network": "hedera:testnet",
+      "payer": "0.0.10123224"
+    }
+  }
+]
