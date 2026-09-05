@@ -1,0 +1,13 @@
+{
+  "name": "@inference-exchange/client",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "main": "client.mjs",
+  "scripts": { "test": "node --test" },
+  "dependencies": {
+    "@hashgraph/sdk": "2.81.0",
+    "@x402/core": "2.22.0",
+    "@x402/hedera": "2.22.0"
+  }
+}
