@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/cryptoscruffy/inference-exchange/registry/internal/hcs"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/hub"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/policy"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/store"
@@ -47,6 +48,10 @@ type server struct {
 	feePayer   string // the facilitator's account, copied into every challenge
 	baseURL    string
 	jobTimeout time.Duration
+
+	// audit is the decision log. It is never nil — an unconfigured deployment gets a no-op — so
+	// nothing on the payment path has to check whether auditing is switched on.
+	audit hcs.Logger
 }
 
 func main() {
@@ -56,6 +61,7 @@ func main() {
 		baseURL    = flag.String("base-url", "", "public base URL for resource descriptors (default http://localhost<addr>)")
 		jobTimeout = flag.Duration("job-timeout", 30*time.Minute, "how long a dispatched job may run")
 		resultTTL  = flag.Duration("result-ttl", 30*time.Minute, "how long a completed result is held awaiting payment")
+		hcsTopic   = flag.String("hcs-topic", envOr("HCS_TOPIC_ID", ""), "HCS topic for the decision log; disabled when empty")
 	)
 	flag.Parse()
 
@@ -72,8 +78,30 @@ func main() {
 		log:        log,
 		baseURL:    *baseURL,
 		jobTimeout: *jobTimeout,
+		audit:      hcs.Discard{},
 	}
 	s.hub.OnStateChange = s.store.SetOnline
+
+	// The decision log is optional. Taking payments must not depend on being able to publish an
+	// audit trail, so a missing or unreachable topic degrades to not recording rather than to not
+	// running.
+	if *hcsTopic != "" {
+		operatorID, operatorKey := os.Getenv("OPERATOR_ID"), os.Getenv("OPERATOR_KEY")
+		if operatorID == "" || operatorKey == "" {
+			log.Error("-hcs-topic needs OPERATOR_ID and OPERATOR_KEY to sign submissions")
+			os.Exit(1)
+		}
+		topic, err := hcs.New(network, *hcsTopic, operatorID, operatorKey, log, hcs.Options{})
+		if err != nil {
+			log.Error("could not open the decision log", "topic", *hcsTopic, "err", err)
+			os.Exit(1)
+		}
+		defer topic.Close()
+		s.audit = topic
+		log.Info("decision log open", "topic", *hcsTopic, "operator", operatorID)
+	} else {
+		log.Info("decision log disabled (no -hcs-topic)")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -242,16 +270,40 @@ func statusOf(j *store.Job) map[string]any {
 // Called at dispatch against the buyer's declared ceiling, and again at collect against the actual
 // price. Two separate calls, two separate decisions: the amount differs between them and the
 // budget can have moved.
-func (s *server) evaluate(buyer string, p *store.Provider, amount int64) policy.Decision {
+// evaluate assembles the buyer's recent history, asks the policy package for a decision, and
+// records it. Auditing lives here rather than at each call site so a new caller cannot decide
+// something without it appearing in the log.
+func (s *server) evaluate(phase, jobID, buyer string, p *store.Provider, amount int64) policy.Decision {
 	spend, _, abandoned, completed := s.store.BuyerStats(buyer, 24*time.Hour)
 	_, inWindow, _, _ := s.store.BuyerStats(buyer, s.limits.VelocityWindow)
 	spendProv, callsProv := s.store.SpendWith(buyer, p.ID)
-	return policy.Evaluate(s.limits, policy.Request{
+	d := policy.Evaluate(s.limits, policy.Request{
 		Buyer: buyer, ProviderID: p.ID, PayTo: p.AccountID, Amount: amount,
 		SpendToday: spend, CallsInWindow: inWindow,
 		SpendWithProv: spendProv, CallsWithProv: callsProv,
 		Abandoned: abandoned, CompletedTotal: completed,
 	})
+
+	decision := hcs.DecisionAllow
+	if d.Deny {
+		decision = hcs.DecisionDeny
+	}
+	s.audit.Write(hcs.Record{
+		Decision: decision, Phase: phase, Rule: d.Rule, Reason: d.Reason,
+		JobID: jobID, Buyer: buyer, PayTo: p.AccountID, Amount: amount,
+		Declared: hcs.Declared{ProviderID: p.ID, Backend: declaredString(p, "backend"),
+			Model: declaredString(p, "model")},
+	})
+	return d
+}
+
+// declaredString reads one provider self-report. Everything it returns is unverified, which is why
+// it only ever lands under a record's declared object.
+func declaredString(p *store.Provider, key string) string {
+	if v, ok := p.Declared[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (s *server) sweep(ctx context.Context, every time.Duration) {

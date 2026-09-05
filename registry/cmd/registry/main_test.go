@@ -12,6 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/cryptoscruffy/inference-exchange/registry/internal/hcs"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/hub"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/policy"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/store"
@@ -34,6 +35,7 @@ func newTestServer(t *testing.T) *server {
 		feePayer:   "0.0.7162784",
 		baseURL:    "http://registry.test",
 		jobTimeout: time.Minute,
+		audit:      hcs.Discard{},
 	}
 	s.hub.OnStateChange = s.store.SetOnline
 	return s
@@ -378,10 +380,10 @@ func TestEvaluateUsesTheRightWindows(t *testing.T) {
 	pid := register(t, s, "0.0.5005", 3)
 	p, _ := s.store.Provider(pid)
 
-	if d := s.evaluate(testBuyer, p, 100); d.Deny {
+	if d := s.evaluate(hcs.PhaseDispatch, "", testBuyer, p, 100); d.Deny {
 		t.Fatalf("a first ordinary payment was denied: %s", d.Reason)
 	}
-	if d := s.evaluate(testBuyer, p, s.limits.PerCallCapTinybar+1); !d.Deny || d.Rule != policy.RulePerCallCap {
+	if d := s.evaluate(hcs.PhaseDispatch, "", testBuyer, p, s.limits.PerCallCapTinybar+1); !d.Deny || d.Rule != policy.RulePerCallCap {
 		t.Errorf("over-cap decision = %+v", d)
 	}
 
@@ -393,7 +395,7 @@ func TestEvaluateUsesTheRightWindows(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if d := s.evaluate(testBuyer, p, 1); !d.Deny || d.Rule != policy.RuleVelocity {
+	if d := s.evaluate(hcs.PhaseDispatch, "", testBuyer, p, 1); !d.Deny || d.Rule != policy.RuleVelocity {
 		t.Errorf("velocity decision = %+v", d)
 	}
 }

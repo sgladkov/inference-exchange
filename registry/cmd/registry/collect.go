@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cryptoscruffy/inference-exchange/registry/internal/hcs"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/policy"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/store"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/x402"
@@ -80,7 +81,7 @@ func (s *server) handleCollect(w http.ResponseWriter, r *http.Request) {
 	if header == "" {
 		// Re-evaluate against the real price, not the ceiling checked at dispatch. Two separate
 		// decisions: the amount differs and the budget may have moved between them.
-		if d := s.evaluate(buyer, p, j.Price); d.Deny {
+		if d := s.evaluate(hcs.PhaseCollect, j.ID, buyer, p, j.Price); d.Deny {
 			s.challenge(w, resource, nil, d.Reason)
 			return
 		}
@@ -134,7 +135,7 @@ func (s *server) handleCollect(w http.ResponseWriter, r *http.Request) {
 			"rule": policy.RulePayerMismatch, "expected": j.BuyerAccount, "actual": ver.Payer}))
 		return
 	}
-	if d := s.evaluate(buyer, p, j.Price); d.Deny {
+	if d := s.evaluate(hcs.PhaseCollect, j.ID, buyer, p, j.Price); d.Deny {
 		s.challenge(w, resource, nil, d.Reason)
 		return
 	}
@@ -153,6 +154,14 @@ func (s *server) handleCollect(w http.ResponseWriter, r *http.Request) {
 
 	s.store.MarkCollected(j.ID, set.Transaction)
 	j.TxID, j.State = set.Transaction, store.JobCollected
+	// The only record here the ledger stands behind. Everything the provider said about the work
+	// stays under declared, where it cannot be mistaken for it.
+	s.audit.Write(hcs.Record{
+		Decision: hcs.DecisionSettled, Phase: hcs.PhaseCollect,
+		JobID: j.ID, Buyer: j.BuyerAccount, PayTo: p.AccountID, Amount: j.Price,
+		Settled:  hcs.Settled{Tx: set.Transaction, Payer: set.Payer, Network: network},
+		Declared: hcs.Declared{ProviderID: p.ID, ReportedUnits: j.Reported},
+	})
 	s.log.Info("job collected", "job", j.ID, "tx", set.Transaction,
 		"payer", set.Payer, "payTo", p.AccountID, "tinybar", j.Price)
 

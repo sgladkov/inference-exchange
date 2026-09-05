@@ -96,6 +96,41 @@ Between the challenge and the result the registry checks, in order:
 An unreachable facilitator **denies** — it never passes through unsettled, and its class is
 distinct from a policy denial so the caller retries rather than changing its budget.
 
+## Decision log
+
+Every spend decision — allow, deny, settlement, provider failure — can be published to a Hedera
+Consensus Service topic, giving a consensus-ordered, tamper-evident record of what the exchange
+decided and why.
+
+```bash
+export OPERATOR_ID=0.0.xxxxx OPERATOR_KEY=0x...   # signs and pays for submissions
+./bin/registry -hcs-topic 0.0.10380084
+```
+
+A record keeps what the ledger settled and what the provider merely claimed in **separate objects**,
+so neither can be mistaken for the other in any rendering:
+
+```jsonc
+{ "decision": "SETTLED", "phase": "collect", "amount_tinybar": 24,
+  "settled":  { "tx": "0.0.7162784@1788622868.909822196", "payer": "0.0.10123224" },
+  "declared": { "provider_id": "prov-d40...", "reported_units": 8 } }   // never verified
+```
+
+Two things this deliberately is not. It is **not a write-ahead log**: submissions take a second or
+two, so they happen asynchronously *after* the decision. A record establishes that a decision was
+written at a consensus timestamp, not that it preceded the action. And it is **not proof a decision
+was correct** — only that it was made and recorded.
+
+The log is optional. With no `-hcs-topic` the exchange behaves identically and publishes nothing:
+an audit trail is a bonus, not a dependency of taking payments. A full queue drops records and
+counts them rather than stalling the payment path it audits.
+
+Read it back with any mirror node:
+
+```bash
+curl -s "https://testnet.mirrornode.hedera.com/api/v1/topics/0.0.10380084/messages?limit=100"
+```
+
 ## Setup
 
 Requires Go 1.26+, Node 24+, pnpm, and a funded Hedera testnet account.
@@ -178,6 +213,8 @@ rather than that the happy path happened to work.
   `StillRunningError` rather than a failure, and can return later with the job id, but nothing
   notifies it.
 - **State is in memory.** Nothing is custodial, so a restart costs at most the jobs in flight.
+- **The decision log is written after the fact, and can drop records.** It is an audit trail, not a
+  write-ahead log, and a saturated queue prefers a visible gap over a stalled payment path.
 - **Testnet only.** The facilitator advertises no `hedera:mainnet` kind.
 - **No marketplace fee.** The exact scheme rejects a third credited party
   (`invalid_exact_hedera_payload_extra_positive_transfers`), so a fee would have to be out of band.

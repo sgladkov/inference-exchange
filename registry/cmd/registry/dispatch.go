@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/cryptoscruffy/inference-exchange/registry/internal/hcs"
 	"github.com/cryptoscruffy/inference-exchange/registry/internal/store"
 )
 
@@ -55,7 +56,7 @@ func (s *server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	// Check the buyer's ceiling against policy before any work is done, so a job that could never
 	// be paid for is refused rather than run. The provider's compute is what is being protected
 	// here — the buyer risks nothing by dispatching, which is also why the abandonment rule exists.
-	if d := s.evaluate(buyer, p, in.MaxUnits*p.RatePerUnit); d.Deny {
+	if d := s.evaluate(hcs.PhaseDispatch, "", buyer, p, in.MaxUnits*p.RatePerUnit); d.Deny {
 		s.log.Info("dispatch denied", "buyer", buyer, "provider", pid, "rule", d.Rule)
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": d.Reason})
 		return
@@ -91,6 +92,11 @@ func (s *server) runJob(jobID, providerID, prompt string, maxUnits, rate int64) 
 	out, err := s.hub.Dispatch(ctx, providerID, jobID, prompt, maxUnits)
 	if err != nil {
 		s.store.Fail(jobID, err.Error())
+		s.audit.Write(hcs.Record{
+			Decision: hcs.DecisionFailed, Phase: hcs.PhaseDispatch,
+			JobID: jobID, Reason: err.Error(),
+			Declared: hcs.Declared{ProviderID: providerID},
+		})
 		s.log.Info("job failed", "job", jobID, "provider", providerID, "err", err)
 		return
 	}
