@@ -43,8 +43,13 @@ export function makeBackends(opt = {}, deps = {}) {
   return {
     // Deterministic, free, no external calls. The default so a demo can be wired up before any
     // model credentials exist.
+    //
+    // A prompt of the form `sleep:<seconds>` takes that long before answering. That exists so the
+    // central claim of the design — that a job outlasting Hedera's 180-second transaction validity
+    // window still settles — can be demonstrated without waiting on a real model to be slow.
     async echo(prompt) {
-      await new Promise((r) => setTimeout(r, 300));
+      const sleep = /^sleep:(\d+)$/.exec(prompt.trim());
+      await new Promise((r) => setTimeout(r, sleep ? Number(sleep[1]) * 1000 : 300));
       return {
         result: `echo(${prompt.length} chars): ${prompt.slice(0, 400)}`,
         units: estimateUnits(prompt),

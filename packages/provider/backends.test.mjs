@@ -157,3 +157,17 @@ test('ollama surfaces a transport error as a failure', async () => {
   const { ollama } = makeBackends({}, { fetch: async () => notOk(500, 'boom'), env: {} });
   await assert.rejects(() => ollama('p'), /ollama 500/);
 });
+
+test('echo sleeps on demand so a long job can be demonstrated', async () => {
+  const { echo } = makeBackends();
+  const started = Date.now();
+  const out = await echo('sleep:1');
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 1000, `took ${elapsed}ms, expected at least 1000`);
+  assert.ok(out.units > 0);
+
+  // Only an exact `sleep:<n>` triggers it; a prompt that merely mentions sleep must not.
+  const t2 = Date.now();
+  await echo('please tell me about sleep:9999 in birds');
+  assert.ok(Date.now() - t2 < 1000, 'a prompt mentioning sleep should not actually sleep');
+});
