@@ -1,0 +1,13 @@
+{
+  "name": "@inference-exchange/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": { "inference-exchange-mcp": "./server.mjs" },
+  "scripts": { "test": "node --test" },
+  "dependencies": {
+    "@inference-exchange/client": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  }
+}

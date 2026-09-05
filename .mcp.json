@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "inference-exchange": {
+      "command": "node",
+      "args": ["packages/mcp/server.mjs"],
+      "env": {
+        "REGISTRY_URL": "http://localhost:8080",
+        "MERCHANT_ID": "${MERCHANT_ID}",
+        "MERCHANT_KEY": "${MERCHANT_KEY}"
+      }
+    }
+  }
+}

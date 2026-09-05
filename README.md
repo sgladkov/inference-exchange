@@ -120,6 +120,23 @@ node demo/e2e.mjs --registry http://localhost:8080
 The registry discovers the facilitator's fee payer at startup and exits if it cannot reach it —
 without that value it would issue challenges nobody can pay.
 
+### Using it from an agent
+
+`.mcp.json` registers the server at project scope, so cloning the repo is enough:
+
+```bash
+export MERCHANT_ID=0.0.xxxxx MERCHANT_KEY=0x...
+claude mcp add inference-exchange -- node packages/mcp/server.mjs
+```
+
+Three tools: `find_providers`, `get_quote`, and `delegate_task` — which dispatches, waits with
+progress notifications, pays, and hands back the result with its transaction id. A failed job costs
+nothing, and every refusal comes back as advice rather than an exception, so the agent is told
+whether to stop, try another provider, or retry later.
+
+`why_blocked` and `spend_report` are not there yet: they need the HCS decision log and a spend
+endpoint respectively. A tool that always answers "unavailable" is worse than no tool.
+
 ### Provider backends
 
 `--backend` selects what the provider actually sells. Registration, wire protocol and payment path
@@ -136,7 +153,7 @@ are identical regardless.
 
 ```bash
 cd registry && go test ./... -race     # 100+ tests, no network
-pnpm -r test                            # provider and client
+pnpm -r test                            # provider, client and MCP server
 node demo/e2e.mjs --registry ...        # live testnet, settles real HBAR
 E2E_LONG_JOB=1 node demo/e2e.mjs ...    # adds the 200-second job, ~3.5 min
 ```
