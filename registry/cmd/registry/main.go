@@ -125,6 +125,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /providers", s.handleListProviders)
 	mux.HandleFunc("GET /providers/{id}", s.handleGetProvider)
 	mux.HandleFunc("GET /connect", s.handleConnect)
+	mux.HandleFunc("POST /p/{id}/job", s.handleDispatch)
 	mux.HandleFunc("GET /p/job/{id}/status", s.handleStatus)
 	return logging(s.log, mux)
 }
