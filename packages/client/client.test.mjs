@@ -8,6 +8,7 @@ import {
   ProviderError,
   UpstreamError,
   ExpiredError,
+  StillRunningError,
 } from './client.mjs';
 
 // A real testnet key: these tests never settle anything, but createClientHederaSigner parses the
@@ -120,7 +121,7 @@ test('quote prices the ceiling, not a prediction', async () => {
 // --- dispatch --------------------------------------------------------------
 
 test('dispatch sends the buyer header and the ceiling', async () => {
-  const { c, calls } = clientWith(() => json(200, { job_id: 'job-1', billable: true, price_tinybar: 30 }));
+  const { c, calls } = clientWith(() => json(202, { job_id: 'job-1', state: 'running' }));
   await c.dispatch('prov-1', 'do the thing', 100);
 
   const body = JSON.parse(calls[0].init.body);
@@ -140,15 +141,66 @@ test('a policy denial at dispatch is a PolicyError with its rule', async () => {
   });
 });
 
-// A failed job comes back as a 200 with billable:false, because the exchange worked and the
-// provider did not. The client must still surface it as an error, and as the right kind.
-test('a failed job at dispatch is a ProviderError, not a success', async () => {
-  const { c } = clientWith(() =>
-    json(200, { job_id: 'job-1', billable: false, error: 'JOB_FAILED {"detail":"backend exploded"}' }),
+test('dispatch returns a job id without a price', async () => {
+  // The price depends on units the provider has not reported yet, so quoting one here would be a
+  // guess presented as a fact.
+  const { c } = clientWith(() => json(202, { job_id: 'job-1', state: 'running' }));
+  const job = await c.dispatch('prov-1', 'p', 100);
+  assert.equal(job.job_id, 'job-1');
+  assert.equal(job.price_tinybar, undefined);
+});
+
+// --- waitFor ---------------------------------------------------------------
+
+test('waitFor polls until the job completes', async () => {
+  const states = ['running', 'running', 'completed'];
+  let i = 0;
+  const { c, calls } = clientWith(() =>
+    json(200, { job_id: 'job-1', state: states[i++] ?? 'completed', price_tinybar: 30, billable: true }),
   );
-  await assert.rejects(() => c.dispatch('prov-1', 'p', 100), (e) => {
+
+  const seen = [];
+  const st = await c.waitFor('job-1', { pollMs: 1, onProgress: (e) => seen.push(e.state) });
+  assert.equal(st.state, 'completed');
+  assert.deepEqual(seen, ['running', 'running', 'completed']);
+  assert.equal(calls.length, 3);
+});
+
+// A failure surfaces here rather than at dispatch: with an async dispatch this is the first moment
+// the outcome is known. Returning it as a value would invite a caller to try collecting it.
+test('waitFor raises a ProviderError when the job fails', async () => {
+  const { c } = clientWith(() =>
+    json(200, { job_id: 'job-1', state: 'failed', billable: false, error: 'the backend exploded' }),
+  );
+  await assert.rejects(() => c.waitFor('job-1', { pollMs: 1 }), (e) => {
     assert.ok(e instanceof ProviderError, `got ${e.name}`);
     assert.equal(e.jobId, 'job-1');
+    assert.match(e.message, /backend exploded/);
+    return true;
+  });
+});
+
+test('waitFor raises an ExpiredError when the result is gone', async () => {
+  const { c } = clientWith(() => json(200, { job_id: 'job-1', state: 'expired' }));
+  await assert.rejects(() => c.waitFor('job-1', { pollMs: 1 }), ExpiredError);
+});
+
+test('waitFor returns an already-collected job rather than looping', async () => {
+  const { c, calls } = clientWith(() => json(200, { job_id: 'job-1', state: 'collected', tx_id: 'tx-1' }));
+  const st = await c.waitFor('job-1', { pollMs: 1 });
+  assert.equal(st.tx_id, 'tx-1');
+  assert.equal(calls.length, 1);
+});
+
+// Giving up waiting is not the same as the job failing, and must not read as one: the work is
+// probably still running and the id is enough to come back to it.
+test('waitFor timing out is its own class, not a failure', async () => {
+  const { c } = clientWith(() => json(200, { job_id: 'job-1', state: 'running' }));
+  await assert.rejects(() => c.waitFor('job-1', { pollMs: 1, timeoutMs: 5 }), (e) => {
+    assert.ok(e instanceof StillRunningError, `got ${e.name}`);
+    assert.ok(!(e instanceof ProviderError), 'a timeout must not look like a provider failure');
+    assert.equal(e.jobId, 'job-1');
+    assert.equal(e.state, 'running');
     return true;
   });
 });
@@ -220,8 +272,9 @@ test('delegate reports each phase in order', async () => {
     },
   ];
   const { c } = clientWith((url, init) => {
-    if (url.endsWith('/job')) {
-      return json(200, { job_id: 'job-1', billable: true, price_tinybar: 30 });
+    if (url.endsWith('/job')) return json(202, { job_id: 'job-1', state: 'running' });
+    if (url.endsWith('/status')) {
+      return json(200, { job_id: 'job-1', state: 'completed', price_tinybar: 30, billable: true });
     }
     if (init.headers?.['PAYMENT-SIGNATURE']) {
       return json(200, { job_id: 'job-1', result: 'the answer', tx_id: 'tx-1', price_tinybar: 30 });
@@ -230,9 +283,9 @@ test('delegate reports each phase in order', async () => {
   });
 
   const phases = [];
-  const out = await c.delegate('prov-1', 'p', 100, (e) => phases.push(e.phase));
+  const out = await c.delegate('prov-1', 'p', 100, (e) => phases.push(e.phase), { pollMs: 1 });
 
-  assert.deepEqual(phases, ['dispatching', 'collecting', 'paid']);
+  assert.deepEqual(phases, ['dispatching', 'running', 'collecting', 'paid']);
   assert.equal(out.result, 'the answer');
   assert.equal(out.tx_id, 'tx-1');
 });
@@ -240,7 +293,10 @@ test('delegate reports each phase in order', async () => {
 test('delegate stops at dispatch without attempting payment', async () => {
   const { c, calls } = clientWith(() => json(403, { error: 'FIREWALL_DENIED {"rule":"velocity"}' }));
   const phases = [];
-  await assert.rejects(() => c.delegate('prov-1', 'p', 100, (e) => phases.push(e.phase)), PolicyError);
+  await assert.rejects(
+    () => c.delegate('prov-1', 'p', 100, (e) => phases.push(e.phase), { pollMs: 1 }),
+    PolicyError,
+  );
   assert.deepEqual(phases, ['dispatching']);
   assert.equal(calls.length, 1);
 });

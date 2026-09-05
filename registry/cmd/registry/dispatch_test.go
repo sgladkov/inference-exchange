@@ -74,56 +74,121 @@ func dispatch(t *testing.T, s *server, pid string, body any, buyer string) *http
 	return do(t, s, "POST", "/p/"+pid+"/job", body, h)
 }
 
-func TestDispatchRunsTheJobAndPricesIt(t *testing.T) {
+func status(t *testing.T, s *server, jobID string) map[string]any {
+	t.Helper()
+	w := do(t, s, "GET", "/p/job/"+jobID+"/status", nil, map[string]string{buyerHeader: testBuyer})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: %d %s", w.Code, w.Body.String())
+	}
+	return decodeBody(t, w)
+}
+
+// awaitTerminal polls status until the job stops moving, the way a real buyer does now that
+// dispatch returns before the work is finished.
+func awaitTerminal(t *testing.T, s *server, jobID string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st := status(t, s, jobID)
+		if st["terminal"] == true || st["state"] == string(store.JobCompleted) {
+			return st
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("job %s never reached a terminal state: %v", jobID, status(t, s, jobID))
+	return nil
+}
+
+// TestDispatchReturnsBeforeTheWorkIsDone is the point of the async shape: the caller gets an id it
+// can poll and come back to, rather than waiting on an open connection for the whole job.
+func TestDispatchReturnsBeforeTheWorkIsDone(t *testing.T) {
+	s := newTestServer(t)
+	release := make(chan struct{})
+	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+		if f.Type != hub.FrameJob {
+			return nil
+		}
+		<-release
+		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "the work product", Units: 10}
+	})
+	defer done()
+	defer close(release)
+
+	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, want 202: %s", w.Code, w.Body.String())
+	}
+	b := decodeBody(t, w)
+
+	jobID, _ := b["job_id"].(string)
+	if jobID == "" {
+		t.Fatal("no job id returned, so the caller cannot poll or recover")
+	}
+	if b["state"] != string(store.JobRunning) {
+		t.Errorf("state = %v, want running", b["state"])
+	}
+	// The price cannot be known yet: it depends on units the provider has not reported.
+	if _, present := b["price_tinybar"]; present {
+		t.Error("dispatch quoted a price before the provider reported any usage")
+	}
+	for _, k := range []string{"status", "collect"} {
+		if got, _ := b[k].(string); !strings.Contains(got, jobID) {
+			t.Errorf("%s = %q, want it to carry the job id", k, got)
+		}
+	}
+
+	// And it is genuinely still running while the provider is held.
+	if st := status(t, s, jobID); st["state"] != string(store.JobRunning) {
+		t.Errorf("status state = %v, want running", st["state"])
+	}
+}
+
+func TestJobCompletesAndIsPricedOnStatus(t *testing.T) {
 	s := newTestServer(t)
 	pid, done := connectProvider(t, s, 3, answerWith("the work product", 10))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "summarise this", "max_units": 100}, testBuyer)
-	if w.Code != http.StatusOK {
-		t.Fatalf("code = %d: %s", w.Code, w.Body.String())
-	}
-	b := decodeBody(t, w)
+	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
+	jobID := decodeBody(t, w)["job_id"].(string)
+	st := awaitTerminal(t, s, jobID)
 
-	if b["billable"] != true {
-		t.Errorf("billable = %v, want true", b["billable"])
+	if st["state"] != string(store.JobCompleted) {
+		t.Fatalf("state = %v", st["state"])
 	}
-	if b["state"] != string(store.JobCompleted) {
-		t.Errorf("state = %v", b["state"])
+	if st["billable"] != true {
+		t.Errorf("billable = %v, want true", st["billable"])
 	}
-	if b["priced_units"] != float64(10) || b["price_tinybar"] != float64(30) {
-		t.Errorf("pricing = %v units / %v tinybar, want 10 and 30", b["priced_units"], b["price_tinybar"])
+	if st["priced_units"] != float64(10) || st["price_tinybar"] != float64(30) {
+		t.Errorf("pricing = %v units / %v tinybar, want 10 and 30", st["priced_units"], st["price_tinybar"])
 	}
-	// The caller needs to be told where to pay; making it construct the path is a second place for
-	// the contract to drift.
-	if got, _ := b["collect"].(string); !strings.Contains(got, b["job_id"].(string)) {
-		t.Errorf("collect = %q, want it to carry the job id", got)
+	// Status is free, so it must not hand over what payment buys.
+	if body := w.Body.String(); strings.Contains(body, "the work product") {
+		t.Error("dispatch leaked the result")
 	}
-	// The result is not in the dispatch response: that is what payment buys.
-	if strings.Contains(w.Body.String(), "the work product") {
-		t.Errorf("dispatch handed over the result for free: %s", w.Body.String())
+	if raw, _ := json.Marshal(st); strings.Contains(string(raw), "the work product") {
+		t.Error("status leaked the result before payment")
 	}
 }
 
-// TestDispatchClampsAnInflatedReport is the metering defence at the HTTP layer. The provider counts
-// the units it bills for, so an inflated claim must cost the buyer nothing above its ceiling — and
-// the raw claim must still be visible, since the aggregate is the only evidence of inflation.
+// TestDispatchClampsAnInflatedReport is the metering defence. The provider counts the units it
+// bills for, so an inflated claim must cost the buyer nothing above its ceiling — and the raw claim
+// must still be visible, since the aggregate is the only evidence of inflation.
 func TestDispatchClampsAnInflatedReport(t *testing.T) {
 	s := newTestServer(t)
 	pid, done := connectProvider(t, s, 3, answerWith("result", 1_000_000))
 	defer done()
 
 	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 50}, testBuyer)
-	b := decodeBody(t, w)
+	st := awaitTerminal(t, s, decodeBody(t, w)["job_id"].(string))
 
-	if b["reported_units"] != float64(1_000_000) {
-		t.Errorf("reported = %v, want the provider's raw claim retained", b["reported_units"])
+	if st["reported_units"] != float64(1_000_000) {
+		t.Errorf("reported = %v, want the provider's raw claim retained", st["reported_units"])
 	}
-	if b["priced_units"] != float64(50) {
-		t.Errorf("priced = %v, want it clamped to the buyer's ceiling of 50", b["priced_units"])
+	if st["priced_units"] != float64(50) {
+		t.Errorf("priced = %v, want it clamped to the buyer's ceiling of 50", st["priced_units"])
 	}
-	if b["price_tinybar"] != float64(150) {
-		t.Errorf("price = %v tinybar, want 150", b["price_tinybar"])
+	if st["price_tinybar"] != float64(150) {
+		t.Errorf("price = %v tinybar, want 150", st["price_tinybar"])
 	}
 }
 
@@ -140,28 +205,22 @@ func TestFailedJobIsFree(t *testing.T) {
 	defer done()
 
 	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	// 200, not an HTTP error: the exchange worked, the provider did not. The caller's move is to
-	// try another provider, and it needs the job id to say what happened.
-	if w.Code != http.StatusOK {
-		t.Fatalf("code = %d, want 200 with billable:false", w.Code)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, want 202", w.Code)
 	}
-	b := decodeBody(t, w)
-	if b["billable"] != false {
-		t.Errorf("billable = %v, want false", b["billable"])
+	jobID := decodeBody(t, w)["job_id"].(string)
+	st := awaitTerminal(t, s, jobID)
+
+	if st["state"] != string(store.JobFailed) {
+		t.Fatalf("state = %v, want failed", st["state"])
 	}
-	if b["state"] != string(store.JobFailed) {
-		t.Errorf("state = %v", b["state"])
+	if st["billable"] != false {
+		t.Errorf("billable = %v, want false", st["billable"])
 	}
-	reason, _ := b["error"].(string)
-	if !strings.HasPrefix(reason, policy.PrefixJobFailed) {
-		t.Errorf("error = %q, want the %s class so a caller can branch on it", reason, policy.PrefixJobFailed)
-	}
-	if !strings.Contains(reason, "the backend exploded") {
-		t.Errorf("the provider's own reason was dropped: %q", reason)
+	if reason, _ := st["error"].(string); !strings.Contains(reason, "the backend exploded") {
+		t.Errorf("error = %q, want the provider's own reason", reason)
 	}
 
-	// And the job must not be collectable: nothing to sell.
-	jobID := b["job_id"].(string)
 	j, err := s.store.Job(jobID, testBuyer)
 	if err != nil {
 		t.Fatal(err)
@@ -171,13 +230,39 @@ func TestFailedJobIsFree(t *testing.T) {
 	}
 }
 
+// TestProviderDisconnectMidJobFailsTheJob covers the case a poller most needs bounded: the provider
+// dies while working. The job must reach a terminal state rather than sit running forever.
+func TestProviderDisconnectMidJobFailsTheJob(t *testing.T) {
+	s := newTestServer(t)
+	arrived := make(chan struct{})
+	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+		if f.Type == hub.FrameJob {
+			close(arrived)
+		}
+		return nil // take the job, then never answer
+	})
+
+	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
+	jobID := decodeBody(t, w)["job_id"].(string)
+
+	<-arrived
+	done() // the provider vanishes
+
+	st := awaitTerminal(t, s, jobID)
+	if st["state"] != string(store.JobFailed) {
+		t.Errorf("state = %v, want failed after a disconnect", st["state"])
+	}
+	if st["billable"] != false {
+		t.Error("a job whose provider vanished is billable")
+	}
+}
+
 func TestDispatchRequiresBuyerHeader(t *testing.T) {
 	s := newTestServer(t)
 	pid, done := connectProvider(t, s, 3, answerWith("r", 1))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 10}, "")
-	if w.Code != http.StatusBadRequest {
+	if w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 10}, ""); w.Code != http.StatusBadRequest {
 		t.Errorf("code = %d, want 400", w.Code)
 	}
 }
@@ -251,7 +336,6 @@ func TestPolicyDeniesBeforeAnyWork(t *testing.T) {
 	})
 	defer done()
 
-	// max_units * rate lands well over the default per-call cap.
 	over := s.limits.PerCallCapTinybar/3 + 100
 	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": over}, testBuyer)
 	if w.Code != http.StatusForbidden {
@@ -280,55 +364,72 @@ func TestPolicyDeniesBeforeAnyWork(t *testing.T) {
 	}
 }
 
-// TestDispatchSurvivesBuyerHangup covers the detached context. A buyer that disconnects mid-job
-// must not cancel work the provider is doing and expects to be paid for; the result is held for
-// collection either way.
-func TestDispatchSurvivesBuyerHangup(t *testing.T) {
+// TestJobOutlivesTheRequest is what makes the async shape safe. The work must not be tied to the
+// connection that started it — a buyer that hangs up has still commissioned work the provider
+// expects to be paid for.
+func TestJobOutlivesTheRequest(t *testing.T) {
 	s := newTestServer(t)
 	release := make(chan struct{})
-	finished := make(chan string, 1)
-
 	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
-		<-release // hold the job open until the buyer has gone away
-		finished <- f.JobID
+		<-release // held until after the request is long gone
 		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "done anyway", Units: 5}
 	})
 	defer done()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	r := httptest.NewRequest("POST", "/p/"+pid+"/job", strings.NewReader(`{"prompt":"x","max_units":100}`)).WithContext(ctx)
+	r := httptest.NewRequest("POST", "/p/"+pid+"/job",
+		strings.NewReader(`{"prompt":"x","max_units":100}`)).WithContext(ctx)
 	r.Header.Set(buyerHeader, testBuyer)
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
 
-	go s.routes().ServeHTTP(httptest.NewRecorder(), r)
-	time.Sleep(100 * time.Millisecond)
-	cancel() // the buyer hangs up
+	jobID := decodeBody(t, w)["job_id"].(string)
+	cancel() // the buyer hangs up before the job finishes
 	close(release)
 
-	var jobID string
-	select {
-	case jobID = <-finished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the job was cancelled when the buyer disconnected")
+	st := awaitTerminal(t, s, jobID)
+	if st["state"] != string(store.JobCompleted) {
+		t.Fatalf("state = %v, want completed despite the hangup", st["state"])
+	}
+	if st["billable"] != true || st["price_tinybar"] != float64(15) {
+		t.Errorf("the result is not payable: %v", st)
+	}
+}
+
+// TestConcurrentDispatchesAreIndependent is the shape async makes possible: several jobs in flight
+// for one buyer, each landing on its own result.
+func TestConcurrentDispatchesAreIndependent(t *testing.T) {
+	s := newTestServer(t)
+	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+		if f.Type != hub.FrameJob {
+			return nil
+		}
+		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: f.Prompt, Units: 1}
+	})
+	defer done()
+
+	s.limits.VelocityCalls = 0 // the rule under test here is correlation, not rate limiting
+	ids := map[string]string{}
+	for i := range 5 {
+		prompt := strings.Repeat("ab", i+1)
+		w := dispatch(t, s, pid, map[string]any{"prompt": prompt, "max_units": 100}, testBuyer)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("dispatch %d: %d %s", i, w.Code, w.Body.String())
+		}
+		ids[decodeBody(t, w)["job_id"].(string)] = prompt
 	}
 
-	// The work must land as a completed, billable result waiting to be collected — not merely
-	// have run to completion inside the provider.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if j, err := s.store.Job(jobID, testBuyer); err == nil && j.State == store.JobCompleted {
-			if !j.Billable() {
-				t.Error("the result is not billable after the buyer hung up")
-			}
-			if j.Price != 15 {
-				t.Errorf("price = %d tinybar, want 15 (5 units at 3)", j.Price)
-			}
-			return
+	for jobID, prompt := range ids {
+		awaitTerminal(t, s, jobID)
+		j, err := s.store.Job(jobID, testBuyer)
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		if j.Result != prompt {
+			t.Errorf("job %s got another job's result: %q, want %q", jobID, j.Result, prompt)
+		}
 	}
-	j, err := s.store.Job(jobID, testBuyer)
-	t.Fatalf("job never reached completed: %+v (err %v)", j, err)
 }

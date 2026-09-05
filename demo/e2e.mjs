@@ -94,6 +94,7 @@ console.log('\ndenials (each must fire before its matching success)');
 
 await check('an unpaid collect is refused with a payable challenge', async () => {
   const job = await c.dispatch(p.provider_id, 'A short warm-up task.', 100);
+  await c.waitFor(job.job_id, { pollMs: 200 });
   const res = await fetch(`${opt.registry}/p/job/${job.job_id}`, {
     headers: { 'X-Buyer-Account': buyer },
   });
@@ -133,6 +134,8 @@ await check('a per-call cap refuses before any work is done', async () => {
 await check('a replayed challenge from another job is refused', async () => {
   const a = await c.dispatch(p.provider_id, 'Job A.', 100);
   const b = await c.dispatch(p.provider_id, 'A rather longer job B, to make its price differ.', 100);
+  await c.waitFor(a.job_id, { pollMs: 200 });
+  await c.waitFor(b.job_id, { pollMs: 200 });
 
   const resA = await fetch(`${opt.registry}/p/job/${a.job_id}`, { headers: { 'X-Buyer-Account': buyer } });
   const chA = JSON.parse(Buffer.from(resA.headers.get('payment-required'), 'base64').toString());
@@ -172,12 +175,17 @@ console.log('\nthe paid path');
 let settled = null;
 await check('dispatch, execute, pay, receive — one call', async () => {
   const phases = [];
-  const out = await c.delegate(p.provider_id, 'Say hello in exactly five words.', 100, (e) =>
-    phases.push(e.phase),
+  const out = await c.delegate(
+    p.provider_id, 'Say hello in exactly five words.', 100,
+    (e) => phases.push(e.phase), { pollMs: 200 },
   );
   assert(out.result, 'no result returned');
   assert(out.tx_id, 'no transaction id');
-  assert(phases.join(',') === 'dispatching,collecting,paid', `phases were ${phases}`);
+  // `running` appears because dispatch now returns before the work does — real progress, not a
+  // heartbeat invented by the client.
+  assert(phases[0] === 'dispatching', `first phase was ${phases[0]}`);
+  assert(phases.includes('running'), 'no progress was reported while the job ran');
+  assert(phases.at(-1) === 'paid', `last phase was ${phases.at(-1)}`);
   settled = out;
   return `${out.price_tinybar} tinybar for ${out.priced_units} units — ${out.tx_id}`;
 });
@@ -215,7 +223,8 @@ await check('an inflated unit report is clamped to the buyer ceiling', async () 
   // The echo backend reports roughly one unit per four characters, so a long prompt with a low
   // ceiling forces the clamp.
   const long = 'x'.repeat(2000);
-  const job = await c.dispatch(p.provider_id, long, 10);
+  const dispatched = await c.dispatch(p.provider_id, long, 10);
+  const job = await c.waitFor(dispatched.job_id, { pollMs: 200 });
   assert(job.reported_units > job.priced_units, 'the provider did not exceed the ceiling');
   assert(job.priced_units === 10, `priced ${job.priced_units}, want the ceiling of 10`);
   assert(
@@ -253,9 +262,23 @@ await check('a job longer than the 180s validity window still settles', async ()
   // The whole reason payment is deferred: no transaction is in flight while the work runs. Skipped
   // unless explicitly requested, since it takes over three minutes.
   if (!process.env.E2E_LONG_JOB) return 'skipped (set E2E_LONG_JOB=1 to run, ~3.5 min)';
-  const out = await c.delegate(p.provider_id, `sleep:${200}`, 100);
+  const started = Date.now();
+  const out = await c.delegate(p.provider_id, 'sleep:200', 100, () => {}, { pollMs: 2000 });
+  const seconds = Math.round((Date.now() - started) / 1000);
   assert(out.tx_id, 'no settlement');
-  return `settled after a long job — ${out.tx_id}`;
+  assert(seconds > 180, `job took ${seconds}s, which does not exercise the window`);
+  return `${seconds}s job settled — ${out.tx_id}`;
+});
+
+await check('a job survives the caller walking away, and can be reclaimed by id', async () => {
+  // Dispatch, drop the client, then come back with only the job id. Under the synchronous shape
+  // this was impossible: the id never reached the caller until the work was already done.
+  const job = await c.dispatch(p.provider_id, 'Work that outlives its requester.', 100);
+  const fresh = createClient({ registry: opt.registry, accountId: buyer, privateKey: key });
+  const done = await fresh.waitFor(job.job_id, { pollMs: 200 });
+  assert(done.state === 'completed', `state ${done.state}`);
+  assert(done.billable === true, 'the reclaimed job is not payable');
+  return `reclaimed ${job.job_id}, ${done.price_tinybar} tinybar owing`;
 });
 
 await check('an offline provider is refused rather than queued', async () => {

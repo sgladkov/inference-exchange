@@ -61,11 +61,13 @@ func billableJob(t *testing.T, s *server, units int64) (jobID string, price int6
 	pid, done := connectProvider(t, s, 3, answerWith("the paid-for result", units))
 	t.Cleanup(done)
 	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	if w.Code != http.StatusOK {
+	if w.Code != http.StatusAccepted {
 		t.Fatalf("dispatch: %d %s", w.Code, w.Body.String())
 	}
-	b := decodeBody(t, w)
-	return b["job_id"].(string), int64(b["price_tinybar"].(float64))
+	jobID = decodeBody(t, w)["job_id"].(string)
+	// Dispatch returns before the work is done, so wait for the price to exist.
+	st := awaitTerminal(t, s, jobID)
+	return jobID, int64(st["price_tinybar"].(float64))
 }
 
 func collect(t *testing.T, s *server, jobID, buyer, paymentHeader string) *httptest.ResponseRecorder {
@@ -259,6 +261,7 @@ func TestNonBillableStatesEachGetTheirOwnClass(t *testing.T) {
 		defer done()
 		w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
 		jobID := decodeBody(t, w)["job_id"].(string)
+		awaitTerminal(t, s, jobID)
 		time.Sleep(2 * time.Millisecond)
 		s.store.Sweep()
 

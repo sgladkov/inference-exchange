@@ -53,6 +53,17 @@ export class ExpiredError extends Error {
   }
 }
 
+/** Waiting gave up before the job did. The job may still be running; come back with its id. */
+export class StillRunningError extends Error {
+  constructor(reason, jobId, state) {
+    super(reason);
+    this.name = 'StillRunningError';
+    this.reason = reason;
+    this.jobId = jobId;
+    this.state = state;
+  }
+}
+
 /**
  * Reasons arrive as `PREFIX {json}` — the reason string is the only field that survives to the
  * caller, so the class token and its evidence are packed into it.
@@ -129,9 +140,11 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
   }
 
   /**
-   * Dispatch a job and wait for it to finish. Free — no payment is taken here, and no Hedera
-   * transaction is in flight while the work runs, so this may block for minutes without anything
-   * expiring.
+   * Dispatch a job. Returns as soon as the registry accepts it, with a job id — not a result.
+   *
+   * Free, and asynchronous: no payment is taken here and no Hedera transaction is in flight while
+   * the work runs, so the job may take minutes without anything expiring. Holding the id from the
+   * outset is what lets a caller report progress and come back after a crash.
    */
   async function dispatch(providerId, prompt, maxUnits) {
     const res = await fetchFn(`${registry}/p/${providerId}/job`, {
@@ -141,9 +154,54 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     });
     const body = await res.json().catch(() => ({}));
     if (res.status === 403) throw classify(body.error ?? 'denied at dispatch');
-    if (!res.ok) throw new Error(`dispatch ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
-    if (body.billable === false) throw classify(body.error ?? 'the provider failed the job', body.job_id);
+    if (res.status !== 202) {
+      throw new Error(`dispatch ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+    }
     return body;
+  }
+
+  /** One status read. Free, and it carries neither the prompt nor the result. */
+  async function status(jobId) {
+    const res = await fetchFn(`${registry}/p/job/${jobId}/status`, { headers });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw classify(body.error ?? `status ${res.status}`, jobId);
+    }
+    return await res.json();
+  }
+
+  /**
+   * Poll until the job stops moving, then return its final status.
+   *
+   * A failed or expired job raises here rather than at dispatch, because with an asynchronous
+   * dispatch this is where the outcome first becomes known. Returning a failed job as a value would
+   * invite a caller to try collecting it.
+   */
+  async function waitFor(jobId, { onProgress = () => {}, pollMs = 1000, timeoutMs = 30 * 60_000 } = {}) {
+    const started = Date.now();
+    for (;;) {
+      const st = await status(jobId);
+      onProgress({ phase: 'running', job: jobId, state: st.state, elapsed_ms: Date.now() - started });
+
+      if (st.state === 'completed' || st.state === 'collected') return st;
+      if (st.state === 'failed') {
+        throw new ProviderError(st.error ?? 'the provider failed the job', jobId);
+      }
+      if (st.state === 'expired') {
+        throw new ExpiredError(st.error ?? 'the result expired before it was collected', jobId);
+      }
+
+      if (Date.now() - started >= timeoutMs) {
+        // This bounds our waiting, not the work: the job is very likely still running registry
+        // side, and its id is enough to come back to it.
+        throw new StillRunningError(
+          `gave up waiting on ${jobId} after ${Math.round(timeoutMs / 1000)}s; it is still ${st.state}`,
+          jobId,
+          st.state,
+        );
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
   }
 
   /**
@@ -181,15 +239,16 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     return await paid.json();
   }
 
-  /** Dispatch, wait, and pay. The whole path in one call. */
-  async function delegate(providerId, prompt, maxUnits, onProgress = () => {}) {
+  /** Dispatch, wait for the work, then pay. The whole path in one call. */
+  async function delegate(providerId, prompt, maxUnits, onProgress = () => {}, opts = {}) {
     onProgress({ phase: 'dispatching', provider: providerId });
     const job = await dispatch(providerId, prompt, maxUnits);
-    onProgress({ phase: 'collecting', job: job.job_id, price: job.price_tinybar });
-    const out = await collect(job.job_id);
+    const done = await waitFor(job.job_id, { ...opts, onProgress });
+    onProgress({ phase: 'collecting', job: done.job_id, price: done.price_tinybar });
+    const out = await collect(done.job_id);
     onProgress({ phase: 'paid', job: out.job_id, tx: out.tx_id, price: out.price_tinybar });
     return out;
   }
 
-  return { findProviders, quote, dispatch, collect, delegate, accountId };
+  return { findProviders, quote, dispatch, status, waitFor, collect, delegate, accountId };
 }

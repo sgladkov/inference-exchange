@@ -16,12 +16,13 @@ buying agent cannot route around.
 ## Why payment comes last
 
 The x402 exact scheme normally wraps the work: verify the payment, do the job, settle. That caps
-job duration at Hedera's **180-second transaction validity window** — the signed transfer expires
-while the work is still running, and the provider does the job for nothing.
+job duration at Hedera's **[180-second transaction validity window](https://docs.hedera.com/hedera/core-concepts/transactions-and-queries)**
+— the signed transfer expires while the work is still running, and the provider does the job for
+nothing.
 
-So payment is deferred instead. Dispatch is free and runs the job to completion; the buyer pays at
-collect, for actual usage, bounded by a ceiling it declared up front. No transaction is in flight
-while the work runs.
+So payment is deferred instead. Dispatch is free and returns a job id immediately, while the work
+runs in the background; the buyer polls until it completes and pays at collect, for actual usage,
+bounded by a ceiling it declared up front. No transaction is in flight while the work runs.
 
 **Verified:** a 200-second job — past the window — dispatches, completes and settles. The payment
 round trip is about two seconds at the very end.
@@ -67,15 +68,21 @@ nothing to withdraw and nothing to sign with.
 ## Payment flow
 
 ```
-POST /p/{provider}/job          free · runs to completion · returns a price
+POST /p/{provider}/job          free · 202 with a job id, immediately
   └─ registry → provider over the open socket
      provider executes, reports units used
      registry clamps units to the buyer's ceiling and prices them
+
+GET  /p/job/{id}/status         free · running → completed, with the price
 
 GET  /p/job/{id}                402 + PAYMENT-REQUIRED
   └─ buyer signs a transfer naming the facilitator as fee payer
 GET  /p/job/{id}                PAYMENT-SIGNATURE → verify → settle → 200 + result
 ```
+
+Dispatch returns before the work does, so the buyer holds the job id from the outset. That is what
+lets it report real progress rather than a heartbeat, and what lets it reclaim a job after a crash
+— the result is held for collection either way.
 
 Between the challenge and the result the registry checks, in order:
 
@@ -146,9 +153,13 @@ rather than that the happy path happened to work.
 - **Buyer identity is asserted at dispatch, not authenticated.** It is checked where it matters:
   the facilitator reports who actually signed, and a mismatch is refused. So a caller can attribute
   a *free* job to another account, but cannot spend their money or read their results.
-- **Dispatch is synchronous.** The HTTP request stays open for the job's duration. There is no way
-  to reconnect to a job in progress if the buyer's process dies, though the result is still held for
-  collection.
+- **No per-provider concurrency limit.** Synchronous dispatch used to provide incidental
+  backpressure — a buyer awaiting a response was not issuing more. Asynchronous dispatch removes
+  that, and only the per-buyer velocity rule bounds the rate. A provider serving several buyers at
+  once can be given more concurrent work than it can handle.
+- **Waiting is client-side.** `waitFor` polls; there is no push. A caller that gives up gets
+  `StillRunningError` rather than a failure, and can return later with the job id, but nothing
+  notifies it.
 - **State is in memory.** Nothing is custodial, so a restart costs at most the jobs in flight.
 - **Testnet only.** The facilitator advertises no `hedera:mainnet` kind.
 - **No marketplace fee.** The exact scheme rejects a third credited party

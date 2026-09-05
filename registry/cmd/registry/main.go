@@ -197,13 +197,42 @@ func (s *server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p)
 }
 
+// handleStatus reports a job's progress and, once it is done, its price. Free, and it never
+// discloses the prompt or the result — those are what payment buys.
+//
+// Since dispatch returns before the work finishes, this is how a buyer learns a job completed, what
+// it will cost, and whether it is payable at all.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	j, err := s.store.Job(r.PathValue("id"), r.Header.Get(buyerHeader))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, j)
+	// billable comes from the store rather than being re-derived by each caller: whether a state is
+	// payable is one rule, and it belongs in one place.
+	writeJSON(w, http.StatusOK, statusOf(j))
+}
+
+// statusOf renders a job for the status endpoint. Job's own JSON tags already hide the prompt and
+// result; this adds the derived fields a caller would otherwise have to infer.
+func statusOf(j *store.Job) map[string]any {
+	out := map[string]any{
+		"job_id": j.ID, "provider_id": j.ProviderID, "state": j.State,
+		"billable": j.Billable(), "terminal": j.State.Terminal(),
+		"max_units": j.MaxUnits, "created_at": j.CreatedAt, "expires_at": j.ExpiresAt,
+	}
+	if j.State == store.JobCompleted || j.State == store.JobCollected {
+		out["reported_units"] = j.Reported
+		out["priced_units"] = j.Priced
+		out["price_tinybar"] = j.Price
+	}
+	if j.Error != "" {
+		out["error"] = j.Error
+	}
+	if j.TxID != "" {
+		out["tx_id"] = j.TxID
+	}
+	return out
 }
 
 // --- policy plumbing -------------------------------------------------------
