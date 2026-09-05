@@ -1,0 +1,8 @@
+{
+  "name": "@inference-exchange/provider",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": { "provider-daemon": "./daemon.mjs" },
+  "scripts": { "test": "node --test" }
+}
