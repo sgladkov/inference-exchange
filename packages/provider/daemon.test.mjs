@@ -8,6 +8,8 @@ import {
   nextBackoff,
   connectURL,
   register,
+  isRetryable,
+  RegistrationError,
   usage,
   INITIAL_BACKOFF,
   MAX_BACKOFF,
@@ -213,6 +215,48 @@ test('register returns the provider id and fails loudly otherwise', async () => 
   );
 });
 
+// --- registration failures: which are worth waiting out --------------------
+
+test('register reports the status so the caller can decide about retrying', async () => {
+  const rejecting = async () => ({ ok: false, status: 400, text: async () => 'bad account' });
+  await assert.rejects(() => register('http://r', { rate: '1' }, rejecting), (e) => {
+    assert.ok(e instanceof RegistrationError, `got ${e.name}`);
+    assert.equal(e.status, 400);
+    return true;
+  });
+});
+
+// A registry that is not listening yet gives no answer at all. This is the case that killed the
+// daemon before: it must be distinguishable from a rejection.
+test('an unreachable registry has no status, and names the URL', async () => {
+  const unreachable = async () => {
+    throw new TypeError('fetch failed');
+  };
+  await assert.rejects(() => register('http://localhost:9', { rate: '1' }, unreachable), (e) => {
+    assert.ok(e instanceof RegistrationError, `got ${e.name}`);
+    assert.equal(e.status, undefined, 'a transport failure must not invent a status');
+    assert.match(e.message, /localhost:9/, 'the operator should be told which registry');
+    return true;
+  });
+});
+
+test('isRetryable waits out a registry that is down, and gives up on a bad registration', () => {
+  // Not yet listening, or unwell: worth waiting out. Launching the registry and a provider from one
+  // script makes the first of these routine.
+  assert.equal(isRetryable(new RegistrationError('unreachable')), true);
+  assert.equal(isRetryable(new RegistrationError('server error', 500)), true);
+  assert.equal(isRetryable(new RegistrationError('gateway', 503)), true);
+
+  // Our request is wrong and will stay wrong; looping would hide a clear error.
+  assert.equal(isRetryable(new RegistrationError('bad account', 400)), false);
+  assert.equal(isRetryable(new RegistrationError('not found', 404)), false);
+  assert.equal(isRetryable(new RegistrationError('conflict', 409)), false);
+
+  // Anything unrecognised is treated as transient rather than fatal: a daemon that keeps trying is
+  // recoverable, one that exited is not.
+  assert.equal(isRetryable(new TypeError('fetch failed')), true);
+});
+
 // --- connection ------------------------------------------------------------
 
 test('connectURL switches scheme and carries the provider id', () => {
@@ -224,6 +268,20 @@ test('connectURL switches scheme and carries the provider id', () => {
     connectURL('https://exchange.example', 'prov-2'),
     'wss://exchange.example/connect?provider_id=prov-2',
   );
+});
+
+// Registration and reconnection share one ladder, so a registry that appears six seconds late is
+// picked up within a couple of attempts rather than needing a restart.
+test('the registration retry ladder reaches a late registry quickly', () => {
+  let b = INITIAL_BACKOFF;
+  let waited = 0;
+  let attempts = 1;
+  while (waited < 6000) {
+    waited += b;
+    b = nextBackoff(b);
+    attempts++;
+  }
+  assert.ok(attempts <= 4, `took ${attempts} attempts to cover 6s`);
 });
 
 test('backoff doubles and then holds at the ceiling', () => {

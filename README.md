@@ -153,7 +153,13 @@ export SELLER_ID=0.0.yyyyy          # provider payee account
 node packages/provider/daemon.mjs \
   --registry http://localhost:8080 --account "$SELLER_ID" \
   --backend echo --rate 3 &
+```
 
+Order does not matter: a provider started before the registry retries registration with backoff and
+joins as soon as it appears. A registration the registry *rejects* is fatal instead — repeating it
+would keep being wrong.
+
+```bash
 node demo/e2e.mjs --registry http://localhost:8080
 ```
 

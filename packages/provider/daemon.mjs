@@ -104,14 +104,48 @@ export async function runJob(execute, send, frame, log = () => {}) {
   }
 }
 
+/**
+ * A registration attempt failed. `status` is the registry's HTTP status, or undefined when the
+ * request never got an answer at all.
+ */
+export class RegistrationError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = 'RegistrationError';
+    this.status = status;
+  }
+}
+
+/**
+ * Whether a registration failure is worth trying again.
+ *
+ * No answer, or a 5xx, means the registry is not up yet or is unwell — both are worth waiting out,
+ * and starting the registry and a provider from the same script makes the first one routine. A 4xx
+ * means this registration is wrong, and sending it again will keep being wrong: retrying would turn
+ * a clear error into a silent loop.
+ */
+export function isRetryable(err) {
+  if (!(err instanceof RegistrationError)) return true; // unrecognised: assume transient
+  if (err.status === undefined) return true;
+  return err.status >= 500;
+}
+
 export async function register(registryURL, opt, fetchFn = globalThis.fetch) {
-  const res = await fetchFn(`${registryURL}/providers`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(registrationBody(opt)),
-  });
+  let res;
+  try {
+    res = await fetchFn(`${registryURL}/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(registrationBody(opt)),
+    });
+  } catch (e) {
+    throw new RegistrationError(`registry unreachable at ${registryURL}: ${e.message}`);
+  }
   if (!res.ok) {
-    throw new Error(`register failed ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    throw new RegistrationError(
+      `register failed ${res.status}: ${(await res.text()).slice(0, 200)}`,
+      res.status,
+    );
   }
   return (await res.json()).provider_id;
 }
@@ -142,8 +176,21 @@ async function main() {
 
   async function connect() {
     if (!providerId) {
-      providerId = await register(opt.registry, opt);
-      console.error(`registered as ${providerId}  (account ${opt.account}, ${opt.rate} tinybar/unit)`);
+      try {
+        providerId = await register(opt.registry, opt);
+        console.error(`registered as ${providerId}  (account ${opt.account}, ${opt.rate} tinybar/unit)`);
+      } catch (e) {
+        if (!isRetryable(e)) {
+          console.error(`fatal: ${e.message}`);
+          process.exit(1);
+        }
+        // The same backoff ladder the socket uses. A registry that is still starting up — HCS setup
+        // alone adds seconds — is the common case when both are launched from one script.
+        console.error(`could not register (${e.message}) — retrying in ${backoff}ms`);
+        setTimeout(connect, backoff);
+        backoff = nextBackoff(backoff);
+        return;
+      }
     }
 
     const url = connectURL(opt.registry, providerId);
