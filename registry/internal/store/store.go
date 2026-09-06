@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -321,6 +322,50 @@ func (s *Store) SpendWith(buyer, providerID string) (spend int64, calls int) {
 		}
 	}
 	return spend, calls
+}
+
+// ProviderSpend is what one buyer has settled with one provider.
+type ProviderSpend struct {
+	ProviderID string `json:"provider_id"`
+	Spend      int64  `json:"spend_tinybar"`
+	Calls      int    `json:"calls"`
+}
+
+// SpendByProvider breaks a buyer's settled spend down by counterparty.
+//
+// Only providers the buyer has actually paid appear: a listing they never used is not part of their
+// spending history, and padding the report with zeroes would bury the rows that matter.
+func (s *Store) SpendByProvider(buyer string) []ProviderSpend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	byProvider := map[string]*ProviderSpend{}
+	for _, jid := range s.byBuyer[buyer] {
+		j, ok := s.jobs[jid]
+		if !ok || j.State != JobCollected {
+			continue
+		}
+		e, seen := byProvider[j.ProviderID]
+		if !seen {
+			e = &ProviderSpend{ProviderID: j.ProviderID}
+			byProvider[j.ProviderID] = e
+		}
+		e.Spend += j.Price
+		e.Calls++
+	}
+
+	out := make([]ProviderSpend, 0, len(byProvider))
+	for _, e := range byProvider {
+		out = append(out, *e)
+	}
+	// Biggest spend first: the rows a buyer is deciding about are the expensive ones.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Spend != out[j].Spend {
+			return out[i].Spend > out[j].Spend
+		}
+		return out[i].ProviderID < out[j].ProviderID
+	})
+	return out
 }
 
 // Sweep expires completed-but-uncollected jobs whose TTL has passed, freeing held results.

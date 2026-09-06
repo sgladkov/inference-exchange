@@ -19,6 +19,7 @@ const stubClient = (overrides = {}) => ({
   quote: async () => ({}),
   delegate: async () => ({}),
   decisions: async () => ({ topicId: '0.0.999', records: [] }),
+  spend: async () => SPEND,
   ...overrides,
 });
 
@@ -32,14 +33,30 @@ async function connect(client) {
 
 const textOf = (res) => res.content.map((c) => c.text).join('\n');
 
+const SPEND = {
+  buyer: '0.0.1001',
+  day: { spent_tinybar: 120, budget_tinybar: 100000, remaining_tinybar: 99880, jobs: 4 },
+  velocity: { calls: 4, limit: 30, window_seconds: 60 },
+  per_call_cap_tinybar: 10000,
+  lifetime: { settled_tinybar: 120, settled_jobs: 4 },
+  abandonment: { abandoned: 0, completed: 4, ratio: 0, limit_ratio: 0.5, judged_after: 4 },
+  by_provider: [{ provider_id: 'prov-1', spend_tinybar: 120, calls: 4 }],
+  unproven_provider: { cap_tinybar: 5000, proven_at: 10 },
+  source: 'registry-side policy state; settlement transaction ids are independently verifiable',
+};
+
 // --- the tool surface ------------------------------------------------------
 
 test('exposes exactly the tools that work today', async () => {
   const mcp = await connect(stubClient());
   const names = (await mcp.listTools()).tools.map((t) => t.name).sort();
-  // spend_report is deliberately still absent: the registry exposes no spend endpoint, and a stub
-  // tool that always says "unavailable" costs the agent a turn to discover it is useless.
-  assert.deepEqual(names, ['delegate_task', 'find_providers', 'get_quote', 'why_blocked']);
+  assert.deepEqual(names, [
+    'delegate_task',
+    'find_providers',
+    'get_quote',
+    'spend_report',
+    'why_blocked',
+  ]);
 });
 
 test('every tool advertises an introspectable schema', async () => {
@@ -330,4 +347,82 @@ test('why_blocked says so plainly when a registry publishes no log', async () =>
   const res = await mcp.callTool({ name: 'why_blocked', arguments: {} });
   assert.ok(!res.isError);
   assert.match(textOf(res), /no decision log/i);
+});
+
+// --- spend_report ----------------------------------------------------------
+
+test('spend_report gives headroom, not just totals', async () => {
+  const mcp = await connect(stubClient());
+  const text = textOf(await mcp.callTool({ name: 'spend_report', arguments: {} }));
+  assert.match(text, /120 tinybar spent/);
+  assert.match(text, /remaining 99880/);
+  assert.match(text, /prov-1/);
+  assert.match(text, /4 of 30 calls/);
+});
+
+// An agent that reads a number treats it as a real ceiling, so an unset limit has to read as words.
+test('spend_report renders an unset limit as unlimited', async () => {
+  const mcp = await connect(
+    stubClient({
+      spend: async () => ({
+        ...SPEND,
+        day: { ...SPEND.day, budget_tinybar: 0, remaining_tinybar: -1 },
+        per_call_cap_tinybar: 0,
+      }),
+    }),
+  );
+  const text = textOf(await mcp.callTool({ name: 'spend_report', arguments: {} }));
+  assert.match(text, /budget unlimited/);
+  assert.ok(!text.includes('remaining -1'), `a raw -1 leaked: ${text}`);
+});
+
+// Below the sample floor the ratio cannot refuse anything, and showing it reads as a warning about
+// nothing.
+test('spend_report mentions abandonment only once it can bite', async () => {
+  const quiet = await connect(
+    stubClient({
+      spend: async () => ({
+        ...SPEND,
+        abandonment: { abandoned: 1, completed: 1, ratio: 1, limit_ratio: 0.5, judged_after: 4 },
+      }),
+    }),
+  );
+  assert.ok(
+    !textOf(await quiet.callTool({ name: 'spend_report', arguments: {} })).includes('Abandonment'),
+    'warned about abandonment before the sample floor',
+  );
+
+  const loud = await connect(
+    stubClient({
+      spend: async () => ({
+        ...SPEND,
+        abandonment: { abandoned: 3, completed: 6, ratio: 0.5, limit_ratio: 0.5, judged_after: 4 },
+      }),
+    }),
+  );
+  const text = textOf(await loud.callTool({ name: 'spend_report', arguments: {} }));
+  assert.match(text, /Abandonment: 3 of 6/);
+  assert.match(text, /wastes a provider/i, 'it should say why this is rate limited');
+});
+
+// The registry is reporting on itself here, unlike why_blocked which reads the chain. Saying so is
+// the difference between a figure and a claim.
+test('spend_report states whose accounting it is', async () => {
+  const mcp = await connect(stubClient());
+  const text = textOf(await mcp.callTool({ name: 'spend_report', arguments: {} }));
+  assert.match(text, /Source: registry-side/);
+  assert.match(text, /verifiable/);
+});
+
+test('spend_report explains a failure rather than throwing', async () => {
+  const mcp = await connect(
+    stubClient({
+      spend: async () => {
+        throw new Error('registry unreachable');
+      },
+    }),
+  );
+  const res = await mcp.callTool({ name: 'spend_report', arguments: {} });
+  assert.ok(!res.isError);
+  assert.match(textOf(res), /registry unreachable/);
 });

@@ -242,6 +242,53 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
     },
   );
 
+  server.registerTool(
+    'spend_report',
+    {
+      title: 'What you have spent, and what is left',
+      description:
+        'Your settled spending and the headroom under each of the exchange\'s limits, broken down by provider. Use it before a large task to see whether it will be refused. These are the registry\'s own figures; the settlements behind them are verifiable on a mirror node.',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const r = await client.spend();
+        const unlimited = (v) => (v === -1 || v === 0 ? 'unlimited' : v);
+
+        const lines = [
+          `Today: ${r.day.spent_tinybar} tinybar spent across ${r.day.jobs} job(s).`,
+          `  budget ${unlimited(r.day.budget_tinybar)}, remaining ${unlimited(r.day.remaining_tinybar)}`,
+          `Per call: at most ${unlimited(r.per_call_cap_tinybar)} tinybar.`,
+          `Rate: ${r.velocity.calls} of ${unlimited(r.velocity.limit)} calls in the last ${r.velocity.window_seconds}s.`,
+          `Lifetime: ${r.lifetime.settled_tinybar} tinybar over ${r.lifetime.settled_jobs} settled job(s).`,
+        ];
+
+        if (r.by_provider?.length) {
+          lines.push('', 'By provider:');
+          for (const p of r.by_provider) {
+            lines.push(`  ${p.provider_id}  ${p.spend_tinybar} tinybar over ${p.calls} call(s)`);
+          }
+        }
+
+        // Only worth surfacing once it can actually refuse a dispatch — before the sample floor it
+        // is noise that reads like a warning.
+        if (r.abandonment.completed >= r.abandonment.judged_after) {
+          lines.push(
+            '',
+            `Abandonment: ${r.abandonment.abandoned} of ${r.abandonment.completed} jobs left uncollected ` +
+              `(${(r.abandonment.ratio * 100).toFixed(0)}%, limit ${(r.abandonment.limit_ratio * 100).toFixed(0)}%). ` +
+              'Dispatching is free, so leaving work uncollected wastes a provider\'s compute and is rate limited.',
+          );
+        }
+
+        lines.push('', `Source: ${r.source}.`);
+        return reply(lines.join('\n'));
+      } catch (e) {
+        return reply(explain(e));
+      }
+    },
+  );
+
   return server;
 }
 

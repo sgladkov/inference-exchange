@@ -257,6 +257,23 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     return { topicId: topic, records: filterDecisions(all, { buyer: accountId, jobId, decision }) };
   }
 
+  /**
+   * What this buyer has spent, and the headroom under each limit.
+   *
+   * Unlike `decisions`, this comes from the registry and has no independent source: budgets and
+   * velocity are registry-side state by design, which is exactly what makes them enforceable
+   * against a buyer who could otherwise edit them. The settlements underneath are checkable on a
+   * mirror node; these totals are the registry's own accounting.
+   */
+  async function spend() {
+    const res = await fetchFn(`${registry}/me/spend`, { headers });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw classify(body.error ?? `spend ${res.status}`);
+    }
+    return await res.json();
+  }
+
   /** Dispatch, wait for the work, then pay. The whole path in one call. */
   async function delegate(providerId, prompt, maxUnits, onProgress = () => {}, opts = {}) {
     onProgress({ phase: 'dispatching', provider: providerId });
@@ -268,5 +285,5 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     return out;
   }
 
-  return { findProviders, quote, dispatch, status, waitFor, collect, delegate, decisions, accountId };
+  return { findProviders, quote, dispatch, status, waitFor, collect, delegate, decisions, spend, accountId };
 }

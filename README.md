@@ -169,7 +169,7 @@ export MERCHANT_ID=0.0.xxxxx MERCHANT_KEY=0x...
 claude mcp add inference-exchange -- node packages/mcp/server.mjs
 ```
 
-Four tools:
+Five tools:
 
 | Tool | Does |
 | --- | --- |
@@ -177,12 +177,16 @@ Four tools:
 | `get_quote` | The ceiling for a task, before committing |
 | `delegate_task` | Dispatch, wait with progress, pay, return the result and its transaction id |
 | `why_blocked` | Read the decision log for your account — refusals, the rule behind each, and settlements |
+| `spend_report` | Settled spend and the headroom under every limit, by provider |
 
 A failed job costs nothing, and every refusal comes back as advice rather than an exception, so the
 agent is told whether to stop, try another provider, or retry later.
 
-`spend_report` is not there yet: the registry exposes no spend endpoint. A tool that always answers
-"unavailable" costs the agent a turn to discover it is useless.
+The last two differ in what they can be trusted for, and say so. `why_blocked` reads the chain, so
+the exchange cannot misreport what it decided. `spend_report` reads the registry, because budgets
+and velocity are registry-side state by design — which is exactly what makes them enforceable
+against a buyer who could otherwise edit them. The settlements underneath are verifiable either
+way.
 
 ### Provider backends
 
