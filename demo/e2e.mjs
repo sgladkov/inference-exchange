@@ -119,8 +119,10 @@ await check('another buyer cannot see the job at all', async () => {
 });
 
 await check('a per-call cap refuses before any work is done', async () => {
-  // The default cap is 10,000 tinybar; ask for far more than that.
-  const huge = Math.ceil(20000 / p.rate_per_unit) + 1000;
+  // Derived from the registry's own reported cap rather than hard-coded: the limits are
+  // configurable, and a demo that assumes a number stops testing anything when it changes.
+  const { per_call_cap_tinybar: cap } = await c.spend();
+  const huge = Math.ceil((cap * 2) / p.rate_per_unit) + 1000;
   try {
     await c.dispatch(p.provider_id, 'This must never run.', huge);
     throw new Error('the dispatch was allowed');

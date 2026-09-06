@@ -135,6 +135,16 @@ test('validate rejects a non-positive or unparseable rate', () => {
   }
 });
 
+test('validate rejects a --tools value that is neither none nor all', () => {
+  const backends = makeBackends();
+  const base = { account: '0.0.1', rate: '1', backend: 'echo' };
+  assert.equal(validate({ ...base, tools: 'none' }, backends), null);
+  assert.equal(validate({ ...base, tools: 'all' }, backends), null);
+  assert.match(validate({ ...base, tools: 'some' }, backends), /--tools/);
+  // Anything unrecognised must not quietly fall through to the permissive branch.
+  assert.match(validate({ ...base, tools: 'ALL' }, backends), /--tools/);
+});
+
 test('validate rejects an unknown backend and names the real ones', () => {
   const backends = makeBackends();
   const msg = validate({ account: '0.0.1', rate: '1', backend: 'telepathy' }, backends);
@@ -294,4 +304,20 @@ test('backoff doubles and then holds at the ceiling', () => {
   assert.deepEqual(seen.slice(0, 4), [1000, 2000, 4000, 8000]);
   assert.equal(b, MAX_BACKOFF, 'backoff must stop growing');
   assert.ok(seen.every((v) => v <= MAX_BACKOFF));
+});
+
+test('runJob logs what a job cost the provider, without sending it', async () => {
+  const [sent, send] = collect();
+  const lines = [];
+  await runJob(
+    async () => ({ result: 'r', units: 14200, costUSD: 0.00825 }),
+    send,
+    { job_id: 'job-1', prompt: 'p', max_units: 20000 },
+    (m) => lines.push(m),
+  );
+  assert.match(lines.join('\n'), /cost=\$0\.008250/);
+  // The buyer pays for units, not for the provider's cost — the two must not be conflated on the
+  // wire, or a warm cache would quietly change the price.
+  assert.equal(sent[1].costUSD, undefined);
+  assert.equal(sent[1].units, 14200);
 });

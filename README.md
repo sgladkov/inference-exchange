@@ -166,6 +166,10 @@ node demo/e2e.mjs --registry http://localhost:8080
 The registry discovers the facilitator's fee payer at startup and exits if it cannot reach it —
 without that value it would issue challenges nobody can pay.
 
+Every spend limit is a flag — `-per-call-cap`, `-daily-budget`, `-velocity-calls`,
+`-velocity-window`, `-unproven-cap`, `-unproven-after`, `-max-abandon-ratio`. Zero switches one off
+rather than setting it to nothing. Run `./bin/registry -h` for the current defaults.
+
 ### Using it from an agent
 
 `.mcp.json` registers the server at project scope, so cloning the repo is enough:
@@ -205,6 +209,56 @@ are identical regardless.
 | `claude-code` | A local Claude Code instance, headless. One agent paying another |
 | `anthropic` | The Messages API, with the provider's own key |
 | `ollama` | A local model |
+
+#### Pricing a `claude-code` provider
+
+A headless invocation consumes **thousands of tokens before it does any work** — almost all of it
+the agent's own context. Measured 6 Sept 2026 with Claude Code 2.1.263:
+
+| `--model` | floor, trivial prompt | a real question | cost cold | cost warm | models actually used |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `haiku` | 10,307 | 10,467 | $0.007716 | $0.002166 | haiku |
+| `sonnet` | 13,396 | 13,368 | $0.016774 | $0.003687 | haiku **+** sonnet |
+| `opus` | 14,196 | 29,361 | $0.039800 | $0.008184 | haiku **+** opus |
+
+Note the first two rows barely move between a trivial prompt and a real one, while **opus roughly
+doubles — and varies about twofold run to run on the identical prompt** (14,396 and 29,361 units for
+the same question, minutes apart). Size a ceiling against the floor, or against one observation, and
+an opus job gets clamped with a third of its work unpaid. That is the buyer's ceiling behaving
+correctly and the ceiling being set wrong.
+
+Five things follow, and each one bites.
+
+**Tiny delegations are uneconomic.** The floor dominates anything short, so this backend suits real
+tasks rather than one-liners.
+
+**Ceilings belong on real jobs, not floors.** `get_quote` before dispatching, and size `max_units`
+against what the model actually uses — especially on opus, which is the variable one.
+
+**Units bill on tokens, not cost.** Token totals are identical cold and warm; cost is three to five
+times higher cold. Cache warmth is something a buyer can neither see nor control, so billing it
+would make the same work cost wildly different amounts. Billing tokens keeps a buyer's ceiling
+meaning the same thing and leaves cache variance with the provider, which is the party that
+controls it. The daemon logs cost per job so a provider can watch its own margin.
+
+**Rates must be set per model.** Cost rises 3.8× from haiku to opus while tokens rise only 1.38×,
+so one flat rate across models underprices the expensive ones badly. Cost per token, normalised to
+haiku, is roughly **1 : 1.3 : 2.7**. Three tiers from one backend:
+
+```bash
+provider-daemon --backend claude-code --model haiku  --rate 2 --name "Fast Tier"
+provider-daemon --backend claude-code --model sonnet --rate 3 --name "Balanced"
+provider-daemon --backend claude-code --model opus   --rate 5 --name "Deep Work"
+```
+
+`rate_per_unit` is whole tinybar, so 2 : 3 : 5 is the closest small-integer fit to 1 : 1.3 : 2.7.
+Finer resolution needs rates an order of magnitude larger, which pushes job prices past the default
+caps — a granularity limit worth knowing before tuning a rate.
+
+**`declared.model` is the model the provider *asked for*, not the only one that ran.** Request
+sonnet or opus and a helper `claude-haiku-4-5` still appears in the invocation's own accounting;
+request haiku and it is the only model used. Like every field under `declared`, it is a provider
+self-report the exchange never verifies — this one is softer than it looks even when honest.
 
 ## Tests
 

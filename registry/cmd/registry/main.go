@@ -63,6 +63,17 @@ func main() {
 		jobTimeout = flag.Duration("job-timeout", 30*time.Minute, "how long a dispatched job may run")
 		resultTTL  = flag.Duration("result-ttl", 30*time.Minute, "how long a completed result is held awaiting payment")
 		hcsTopic   = flag.String("hcs-topic", envOr("HCS_TOPIC_ID", ""), "HCS topic for the decision log; disabled when empty")
+
+		// Spend limits. Zero disables a ceiling rather than setting it to nothing, so an operator
+		// can switch one off without editing the others.
+		def           = policy.Defaults()
+		perCallCap    = flag.Int64("per-call-cap", def.PerCallCapTinybar, "most tinybar one job may cost; 0 for no cap")
+		dailyBudget   = flag.Int64("daily-budget", def.DailyBudgetTinybar, "most tinybar one buyer may spend in 24h; 0 for no budget")
+		velocityCalls = flag.Int("velocity-calls", def.VelocityCalls, "most dispatches per buyer per window; 0 for no limit")
+		velocityWin   = flag.Duration("velocity-window", def.VelocityWindow, "the window velocity-calls applies over")
+		unprovenCap   = flag.Int64("unproven-cap", def.UnprovenSpendCap, "most tinybar to spend with a provider before it is proven; 0 for no cap")
+		unprovenAfter = flag.Int("unproven-after", def.UnprovenAfterCalls, "settled calls after which a provider counts as proven")
+		abandonRatio  = flag.Float64("max-abandon-ratio", def.MaxAbandonRatio, "share of a buyer's jobs that may go uncollected; 0 for no limit")
 	)
 	flag.Parse()
 
@@ -72,10 +83,19 @@ func main() {
 	}
 
 	s := &server{
-		store:      store.New(*resultTTL),
-		hub:        hub.New(log),
-		fac:        x402.NewClient(*facURL, 30*time.Second),
-		limits:     policy.Defaults(),
+		store: store.New(*resultTTL),
+		hub:   hub.New(log),
+		fac:   x402.NewClient(*facURL, 30*time.Second),
+		limits: policy.Limits{
+			PerCallCapTinybar:  *perCallCap,
+			DailyBudgetTinybar: *dailyBudget,
+			VelocityCalls:      *velocityCalls,
+			VelocityWindow:     *velocityWin,
+			UnprovenSpendCap:   *unprovenCap,
+			UnprovenAfterCalls: *unprovenAfter,
+			MaxAbandonRatio:    *abandonRatio,
+			MinJobsBeforeRatio: def.MinJobsBeforeRatio,
+		},
 		log:        log,
 		baseURL:    *baseURL,
 		jobTimeout: *jobTimeout,
@@ -140,6 +160,9 @@ func main() {
 		srv.Shutdown(shutCtx)
 	}()
 
+	log.Info("spend limits", "per_call_cap", s.limits.PerCallCapTinybar,
+		"daily_budget", s.limits.DailyBudgetTinybar, "velocity", s.limits.VelocityCalls,
+		"unproven_cap", s.limits.UnprovenSpendCap)
 	log.Info("registry listening", "addr", *addr, "base_url", *baseURL)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server stopped", "err", err)

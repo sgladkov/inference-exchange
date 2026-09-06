@@ -63,13 +63,21 @@ type Limits struct {
 }
 
 // Defaults are deliberately loose enough to demo and tight enough to deny visibly.
+//
+// The per-call cap has to clear a real backend's real jobs, not its floor. A headless Claude Code
+// invocation consumes about 14,200 tokens before doing anything — almost all of it the agent's own
+// context — and a genuine question roughly doubles that on the largest model. Caps sized for the
+// echo backend's handful of units made the flagship unusable; caps sized for the floor let it
+// register a job and then clamp two thirds of the work away.
 func Defaults() Limits {
 	return Limits{
-		PerCallCapTinybar:  10_000,
-		DailyBudgetTinybar: 100_000,
+		PerCallCapTinybar:  300_000,
+		DailyBudgetTinybar: 3_000_000,
 		VelocityCalls:      30,
 		VelocityWindow:     time.Minute,
-		UnprovenSpendCap:   5_000,
+		// Also above one real job, for the same reason: a cap that no first job fits under does not
+		// bound exposure to an unproven provider, it just refuses every new one.
+		UnprovenSpendCap:   600_000,
 		UnprovenAfterCalls: 10,
 		MaxAbandonRatio:    0.5,
 		MinJobsBeforeRatio: 4,

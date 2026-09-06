@@ -7,6 +7,9 @@
 // sign with and nothing to withdraw.
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { makeBackends } from './backends.mjs';
 
 export const MAX_BACKOFF = 30_000;
@@ -24,6 +27,8 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
       rate: { type: 'string', default: '1' }, // tinybar per unit
       capability: { type: 'string', default: 'text-generation' },
       'provider-id': { type: 'string', default: '' },
+      tools: { type: 'string', default: 'none' },
+      workdir: { type: 'string', default: '' },
       help: { type: 'boolean', default: false },
     },
   });
@@ -41,6 +46,8 @@ export function usage(backendNames) {
   --name <text>         display name in the listing
   --capability <name>   what is being sold          (default text-generation)
   --provider-id <id>    reconnect as an existing registration
+  --tools none|all      whether a buyer's prompt may use tools    (default none)
+  --workdir <path>      where backends run (default: a fresh temp directory)
 
 No private key is needed or accepted: payments settle straight to --account.`;
 }
@@ -54,6 +61,9 @@ export function validate(opt, backends) {
   }
   if (!backends[opt.backend]) {
     return `unknown backend ${opt.backend}; have: ${Object.keys(backends).join(', ')}`;
+  }
+  if (opt.tools !== undefined && !['none', 'all'].includes(opt.tools)) {
+    return `--tools must be none or all, got ${opt.tools}`;
   }
   return null;
 }
@@ -90,13 +100,16 @@ export async function runJob(execute, send, frame, log = () => {}) {
   const started = Date.now();
   send({ type: 'accepted', job_id: frame.job_id });
   try {
-    const { result, units } = await execute(frame.prompt, frame.max_units);
+    const { result, units, costUSD } = await execute(frame.prompt, frame.max_units);
     send({ type: 'result', job_id: frame.job_id, result: String(result ?? ''), units });
     const over =
       units > frame.max_units
         ? `  (over the buyer's ceiling of ${frame.max_units}; it will be clamped)`
         : '';
-    log(`  done ${Date.now() - started}ms  units=${units}${over}`);
+    // Cost is the provider's own concern, not the buyer's price, so it is logged here rather than
+    // sent. A backend that knows what a job cost lets its operator see the margin per job.
+    const cost = typeof costUSD === 'number' ? `  cost=$${costUSD.toFixed(6)}` : '';
+    log(`  done ${Date.now() - started}ms  units=${units}${cost}${over}`);
   } catch (e) {
     const detail = String(e?.message ?? e).slice(0, 300);
     send({ type: 'failed', job_id: frame.job_id, error: detail });
@@ -168,6 +181,18 @@ async function main() {
   if (problem) {
     console.error(problem + '\n\n' + usage(Object.keys(backends)));
     process.exit(1);
+  }
+
+  // Backends run somewhere with nothing of the provider's in it, rather than wherever the daemon
+  // was launched from. With tools off this is belt and braces; with `--tools all` it is the only
+  // thing standing between a buyer's prompt and the provider's files.
+  if (!opt.workdir) {
+    opt.workdir = mkdtempSync(join(tmpdir(), 'ix-provider-'));
+  }
+  if (opt.tools === 'all') {
+    console.error(
+      `⚠ --tools all: buyers' prompts may run tools in ${opt.workdir}. Only do this in a sandbox.`,
+    );
   }
 
   const execute = backends[opt.backend];
