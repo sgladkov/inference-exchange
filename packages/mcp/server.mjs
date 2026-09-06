@@ -17,6 +17,7 @@ import {
   UpstreamError,
   ExpiredError,
   StillRunningError,
+  describeDecision,
 } from '@inference-exchange/client';
 
 export const CONFIG_HELP = `Set these before starting the server:
@@ -193,6 +194,47 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
           `${out.result}\n\n---\nPaid ${out.price_tinybar} tinybar for ${out.priced_units} units.\n` +
             `Settled on Hedera testnet: ${out.tx_id}\n` +
             `https://hashscan.io/testnet/transaction/${out.tx_id}${clamped}`,
+        );
+      } catch (e) {
+        return reply(explain(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    'why_blocked',
+    {
+      title: 'Explain what the exchange decided, and why',
+      description:
+        "Read the exchange's decision log for your account: refusals and the rule that caused them, settlements, and provider failures. The log lives on a public Hedera topic and is read from a mirror node, so the exchange cannot alter or withhold what it decided about you.",
+      inputSchema: {
+        job_id: z.string().optional().describe('narrow to one job'),
+        only_refusals: z.boolean().optional().describe('show only denials'),
+        limit: z.number().int().positive().optional().describe('how many records to read (default 50)'),
+      },
+    },
+    async ({ job_id, only_refusals, limit }) => {
+      try {
+        const { topicId, records } = await client.decisions({
+          jobId: job_id,
+          decision: only_refusals ? 'DENY' : undefined,
+          limit: limit ?? 50,
+        });
+
+        if (!records.length) {
+          return reply(
+            `No decisions recorded for your account on topic ${topicId}` +
+              (job_id ? ` for job ${job_id}` : '') +
+              '.\n\nRecords are published asynchronously and take a few seconds to reach a mirror node, so a very recent decision may not be visible yet.',
+          );
+        }
+
+        const lines = records.map(describeDecision).join('\n\n');
+        return reply(
+          `${records.length} decision(s) on topic ${topicId}, newest first:\n\n${lines}\n\n` +
+            'These records establish that the exchange wrote each decision at a consensus timestamp. ' +
+            'They do not establish that a decision was correct, and because they are written after the ' +
+            'fact they do not establish that one preceded the action it describes.',
         );
       } catch (e) {
         return reply(explain(e));

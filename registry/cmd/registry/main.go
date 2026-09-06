@@ -46,6 +46,7 @@ type server struct {
 	log    *slog.Logger
 
 	feePayer   string // the facilitator's account, copied into every challenge
+	hcsTopic   string // the decision log's topic, empty when auditing is off
 	baseURL    string
 	jobTimeout time.Duration
 
@@ -98,6 +99,7 @@ func main() {
 		}
 		defer topic.Close()
 		s.audit = topic
+		s.hcsTopic = *hcsTopic
 		log.Info("decision log open", "topic", *hcsTopic, "operator", operatorID)
 	} else {
 		log.Info("decision log disabled (no -hcs-topic)")
@@ -324,8 +326,12 @@ func (s *server) sweep(ctx context.Context, every time.Duration) {
 // --- misc ------------------------------------------------------------------
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// hcs_topic is advertised so a buyer can find the decision log without being told out of band.
+	// Discovery only: the records themselves are read from a mirror node, so the registry is not
+	// trusted to report what it decided about you.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok", "network": network, "fee_payer": s.feePayer})
+		"status": "ok", "network": network, "fee_payer": s.feePayer,
+		"hcs_topic": s.hcsTopic})
 }
 
 func (s *server) handleUCP(w http.ResponseWriter, r *http.Request) {

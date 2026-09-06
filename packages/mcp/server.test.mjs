@@ -18,6 +18,7 @@ const stubClient = (overrides = {}) => ({
   findProviders: async () => [],
   quote: async () => ({}),
   delegate: async () => ({}),
+  decisions: async () => ({ topicId: '0.0.999', records: [] }),
   ...overrides,
 });
 
@@ -36,9 +37,9 @@ const textOf = (res) => res.content.map((c) => c.text).join('\n');
 test('exposes exactly the tools that work today', async () => {
   const mcp = await connect(stubClient());
   const names = (await mcp.listTools()).tools.map((t) => t.name).sort();
-  // why_blocked and spend_report are deliberately absent until the HCS log and a spend endpoint
-  // exist. A stub tool that always says "unavailable" is worse than no tool.
-  assert.deepEqual(names, ['delegate_task', 'find_providers', 'get_quote']);
+  // spend_report is deliberately still absent: the registry exposes no spend endpoint, and a stub
+  // tool that always says "unavailable" costs the agent a turn to discover it is useless.
+  assert.deepEqual(names, ['delegate_task', 'find_providers', 'get_quote', 'why_blocked']);
 });
 
 test('every tool advertises an introspectable schema', async () => {
@@ -258,4 +259,75 @@ test('reply produces the content shape the protocol expects', () => {
   const r = reply('hello');
   assert.equal(r.content[0].type, 'text');
   assert.equal(r.content[0].text, 'hello');
+});
+
+// --- why_blocked -----------------------------------------------------------
+
+const DENIAL = {
+  decision: 'DENY',
+  phase: 'dispatch',
+  rule: 'per-call-cap',
+  reason: 'FIREWALL_DENIED {"rule":"per-call-cap","limit":10000}',
+  buyer: '0.0.1001',
+  amount_tinybar: 23001,
+  consensus_timestamp: '1788622868.000000000',
+  settled: { tx: '' },
+  declared: { provider_id: 'prov-1' },
+};
+
+test('why_blocked names the rule and the topic it was read from', async () => {
+  const mcp = await connect(
+    stubClient({ decisions: async () => ({ topicId: '0.0.10380084', records: [DENIAL] }) }),
+  );
+  const text = textOf(await mcp.callTool({ name: 'why_blocked', arguments: {} }));
+  assert.match(text, /per-call-cap/);
+  assert.match(text, /0\.0\.10380084/, 'the agent should be able to check the log itself');
+});
+
+test('why_blocked passes its filters through', async () => {
+  let seen;
+  const mcp = await connect(
+    stubClient({
+      decisions: async (o) => ((seen = o), { topicId: '0.0.999', records: [] }),
+    }),
+  );
+  await mcp.callTool({
+    name: 'why_blocked',
+    arguments: { job_id: 'job-7', only_refusals: true, limit: 10 },
+  });
+  assert.equal(seen.jobId, 'job-7');
+  assert.equal(seen.decision, 'DENY');
+  assert.equal(seen.limit, 10);
+});
+
+// Records are published asynchronously, so "nothing yet" is a real and expected state that must not
+// read as "nothing happened".
+test('why_blocked explains an empty log rather than implying nothing occurred', async () => {
+  const mcp = await connect(stubClient());
+  const text = textOf(await mcp.callTool({ name: 'why_blocked', arguments: {} }));
+  assert.match(text, /No decisions recorded/);
+  assert.match(text, /asynchronously|may not be visible yet/i);
+});
+
+// The tool must not overclaim on behalf of the log: consensus ordering is not correctness.
+test('why_blocked states what the records do and do not establish', async () => {
+  const mcp = await connect(
+    stubClient({ decisions: async () => ({ topicId: '0.0.999', records: [DENIAL] }) }),
+  );
+  const text = textOf(await mcp.callTool({ name: 'why_blocked', arguments: {} }));
+  assert.match(text, /consensus timestamp/i);
+  assert.match(text, /do not establish that a decision was correct/i);
+});
+
+test('why_blocked says so plainly when a registry publishes no log', async () => {
+  const mcp = await connect(
+    stubClient({
+      decisions: async () => {
+        throw new Error('this registry publishes no decision log (no hcs_topic at /health)');
+      },
+    }),
+  );
+  const res = await mcp.callTool({ name: 'why_blocked', arguments: {} });
+  assert.ok(!res.isError);
+  assert.match(textOf(res), /no decision log/i);
 });

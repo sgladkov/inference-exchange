@@ -11,6 +11,9 @@ import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { ExactHederaScheme } from '@x402/hedera/exact/client';
 import { createClientHederaSigner, PrivateKey } from '@x402/hedera';
 import { decodePaymentRequiredHeader } from '@x402/core/http';
+import { readDecisions, filterDecisions, discoverTopic, MIRROR_TESTNET } from './audit.mjs';
+
+export * from './audit.mjs';
 
 export const NETWORK = 'hedera:testnet';
 
@@ -239,6 +242,21 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     return await paid.json();
   }
 
+  /**
+   * Read this buyer's decisions out of the exchange's log.
+   *
+   * Read from a mirror node, not from the registry: the registry says which topic to look at, but
+   * cannot alter or withhold what is on it. That independence is the reason the log is on-chain.
+   */
+  async function decisions({ jobId, decision, topicId, mirror = MIRROR_TESTNET, limit = 100 } = {}) {
+    const topic = topicId || (await discoverTopic(registry, fetchFn));
+    if (!topic) {
+      throw new Error('this registry publishes no decision log (no hcs_topic at /health)');
+    }
+    const all = await readDecisions({ topicId: topic, mirror, limit, fetch: fetchFn });
+    return { topicId: topic, records: filterDecisions(all, { buyer: accountId, jobId, decision }) };
+  }
+
   /** Dispatch, wait for the work, then pay. The whole path in one call. */
   async function delegate(providerId, prompt, maxUnits, onProgress = () => {}, opts = {}) {
     onProgress({ phase: 'dispatching', provider: providerId });
@@ -250,5 +268,5 @@ export function createClient({ registry, accountId, privateKey, fetch: fetchFn =
     return out;
   }
 
-  return { findProviders, quote, dispatch, status, waitFor, collect, delegate, accountId };
+  return { findProviders, quote, dispatch, status, waitFor, collect, delegate, decisions, accountId };
 }

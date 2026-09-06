@@ -131,6 +131,11 @@ Read it back with any mirror node:
 curl -s "https://testnet.mirrornode.hedera.com/api/v1/topics/0.0.10380084/messages?limit=100"
 ```
 
+Or ask the agent — `why_blocked` does the same read. **It goes to a mirror node, not to the
+registry.** The registry advertises which topic to read at `/health`, but cannot alter or withhold
+what is on it; a buyer auditing the exchange should not have to ask the exchange what it decided.
+That independence is the reason the log is on-chain rather than in a database.
+
 ## Setup
 
 Requires Go 1.26+, Node 24+, pnpm, and a funded Hedera testnet account.
@@ -164,13 +169,20 @@ export MERCHANT_ID=0.0.xxxxx MERCHANT_KEY=0x...
 claude mcp add inference-exchange -- node packages/mcp/server.mjs
 ```
 
-Three tools: `find_providers`, `get_quote`, and `delegate_task` — which dispatches, waits with
-progress notifications, pays, and hands back the result with its transaction id. A failed job costs
-nothing, and every refusal comes back as advice rather than an exception, so the agent is told
-whether to stop, try another provider, or retry later.
+Four tools:
 
-`why_blocked` and `spend_report` are not there yet: they need the HCS decision log and a spend
-endpoint respectively. A tool that always answers "unavailable" is worse than no tool.
+| Tool | Does |
+| --- | --- |
+| `find_providers` | Who is online, at what price, claiming what |
+| `get_quote` | The ceiling for a task, before committing |
+| `delegate_task` | Dispatch, wait with progress, pay, return the result and its transaction id |
+| `why_blocked` | Read the decision log for your account — refusals, the rule behind each, and settlements |
+
+A failed job costs nothing, and every refusal comes back as advice rather than an exception, so the
+agent is told whether to stop, try another provider, or retry later.
+
+`spend_report` is not there yet: the registry exposes no spend endpoint. A tool that always answers
+"unavailable" costs the agent a turn to discover it is useless.
 
 ### Provider backends
 
