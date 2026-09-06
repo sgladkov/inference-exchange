@@ -38,6 +38,14 @@ const (
 	PrefixJobRunning  = "JOB_RUNNING"
 	PrefixJobExpired  = "JOB_EXPIRED"
 	PrefixNotBillable = "JOB_NOT_BILLABLE"
+
+	// A provider looked at the work and refused it. Distinct from a failure: nothing broke, and the
+	// caller's move is to quote someone else rather than to retry.
+	PrefixDeclined = "PROVIDER_DECLINED"
+	// The provider could not be asked for a price at all.
+	PrefixQuoteFailed = "QUOTE_FAILED"
+	// The quote is gone, spent, or was never this buyer's.
+	PrefixQuoteInvalid = "QUOTE_INVALID"
 )
 
 // Limits is the configured policy. Zero means unlimited for every ceiling.

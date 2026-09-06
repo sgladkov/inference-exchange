@@ -9,9 +9,13 @@
 // Requires MERCHANT_ID and MERCHANT_KEY in the environment, a running registry, and at least one
 // connected provider. Each paid step settles real testnet HBAR.
 import { parseArgs } from 'node:util';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   createClient,
   PolicyError,
+  DeclinedError,
+  QuoteError,
   ProviderError,
   UpstreamError,
 } from '../packages/client/client.mjs';
@@ -82,10 +86,55 @@ if (!providers.length) {
 const p = providers[0];
 console.log(`  provider ${p.provider_id}  ${p.rate_per_unit} tinybar/unit  declared=${JSON.stringify(p.declared)}\n`);
 
-await check('a quote prices the ceiling, not a prediction', async () => {
-  const q = await c.quote(p.provider_id, 100);
-  assert(q.max_price_tinybar === p.rate_per_unit * 100, 'quote does not match the advertised rate');
-  return `${q.max_price_tinybar} tinybar max for 100 units`;
+/** Quote a prompt and accept the price. Two calls, because that is now the shape of buying. */
+async function buy(prompt) {
+  const q = await c.quote(p.provider_id, prompt);
+  return await c.dispatch(p.provider_id, q.quote_id);
+}
+
+// Two real quotes, kept because the cap test below solves for a prompt size using them. Measuring
+// the provider's pricing rather than assuming it keeps this working across backends and rates.
+const SHORT = 'Say hello.';
+const LONG = 'x'.repeat(4000);
+let shortQuote;
+let longQuote;
+
+await check('a quote prices this prompt, and a longer one costs more', async () => {
+  shortQuote = await c.quote(p.provider_id, SHORT);
+  longQuote = await c.quote(p.provider_id, LONG);
+
+  assert(shortQuote.quote_id, 'no quote id');
+  assert(shortQuote.price_tinybar === shortQuote.estimate_units * p.rate_per_unit,
+    'price does not match the advertised rate');
+  // The point of the round trip: the provider read this prompt and priced it, so a longer task is
+  // a dearer one. A per-unit rate card alone could never have said this.
+  assert(longQuote.estimate_units > shortQuote.estimate_units,
+    `4000 chars quoted ${longQuote.estimate_units}, 10 chars quoted ${shortQuote.estimate_units}`);
+  return `${shortQuote.price_tinybar} vs ${longQuote.price_tinybar} tinybar`;
+});
+
+await check('quoting costs nothing and commissions nothing', async () => {
+  // Ten quotes, no jobs. If quoting were doing the work, this is where it would show.
+  const before = await c.spend();
+  await Promise.all(Array.from({ length: 10 }, () => c.quote(p.provider_id, 'A task I will not buy.')));
+  const after = await c.spend();
+  assert(after.lifetime.settled_tinybar === before.lifetime.settled_tinybar,
+    'quoting moved money');
+  return `10 quotes, ${after.lifetime.settled_tinybar - before.lifetime.settled_tinybar} tinybar spent`;
+});
+
+await check('several providers price the same prompt independently', async () => {
+  const ids = providers.map((x) => x.provider_id);
+  if (ids.length < 2) return `skipped (only ${ids.length} provider online)`;
+  const all = await c.quoteAll(ids, 'Summarise the trade-offs in deferred settlement.');
+  const priced = all.filter((q) => !q.declined);
+  assert(priced.length >= 1, 'nobody quoted');
+  const line = all
+    .map((q) => (q.declined ? `${q.provider_id}=declined` : `${q.provider_id}=${q.price_tinybar}`))
+    .join('  ');
+  // Not asserting the prices differ — they legitimately may not. What matters is that each
+  // provider answered for itself, which is the comparison that checks a padded estimate.
+  return line;
 });
 
 // --- 1. falsifying branches, before anything succeeds ----------------------
@@ -93,7 +142,7 @@ await check('a quote prices the ceiling, not a prediction', async () => {
 console.log('\ndenials (each must fire before its matching success)');
 
 await check('an unpaid collect is refused with a payable challenge', async () => {
-  const job = await c.dispatch(p.provider_id, 'A short warm-up task.', 100);
+  const job = await buy('A short warm-up task.');
   await c.waitFor(job.job_id, { pollMs: 200 });
   const res = await fetch(`${opt.registry}/p/job/${job.job_id}`, {
     headers: { 'X-Buyer-Account': buyer },
@@ -118,24 +167,78 @@ await check('another buyer cannot see the job at all', async () => {
   return '404';
 });
 
-await check('a per-call cap refuses before any work is done', async () => {
-  // Derived from the registry's own reported cap rather than hard-coded: the limits are
-  // configurable, and a demo that assumes a number stops testing anything when it changes.
+await check('a per-call cap refuses at quote time, before any work is asked for', async () => {
+  // Derived from the registry's own reported cap and from this provider's measured pricing, rather
+  // than hard-coded: limits are configurable and backends price differently, so a demo that assumes
+  // either number quietly stops testing anything.
   const { per_call_cap_tinybar: cap } = await c.spend();
-  const huge = Math.ceil((cap * 2) / p.rate_per_unit) + 1000;
+  if (!cap) return 'skipped (no per-call cap configured)';
+
+  const perChar =
+    (longQuote.estimate_units - shortQuote.estimate_units) / (LONG.length - SHORT.length);
+  assert(perChar > 0, 'this provider does not price by prompt size; cannot size the test prompt');
+  const needUnits = Math.ceil(cap / p.rate_per_unit) + 1000;
+  const chars = Math.ceil((needUnits - shortQuote.estimate_units) / perChar) + SHORT.length;
+  if (chars > 4_000_000) return `skipped (would need a ${chars}-char prompt)`;
+
   try {
-    await c.dispatch(p.provider_id, 'This must never run.', huge);
-    throw new Error('the dispatch was allowed');
+    await c.quote(p.provider_id, 'y'.repeat(chars));
+    throw new Error('the quote was allowed');
   } catch (e) {
     assert(e instanceof PolicyError, `got ${e.name}: ${e.message}`);
     assert(e.rule === 'per-call-cap', `rule was ${e.rule}`);
-    return `${e.rule}`;
+    return `${e.rule} on a ${chars}-char prompt`;
   }
 });
 
+await check('a quote is single-use', async () => {
+  // Otherwise one accepted price buys unlimited work: the quote is the agreement, and an agreement
+  // that can be replayed is not one.
+  const q = await c.quote(p.provider_id, 'Spend me once.');
+  await c.dispatch(p.provider_id, q.quote_id);
+  try {
+    await c.dispatch(p.provider_id, q.quote_id);
+    throw new Error('the quote was spent twice');
+  } catch (e) {
+    assert(e instanceof QuoteError, `got ${e.name}: ${e.message}`);
+    return 'second dispatch refused';
+  }
+});
+
+await check('another buyer cannot spend this buyer\'s quote', async () => {
+  const q = await c.quote(p.provider_id, 'Not yours to accept.');
+  const res = await fetch(`${opt.registry}/p/${p.provider_id}/job`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Buyer-Account': '0.0.999999' },
+    body: JSON.stringify({ quote_id: q.quote_id }),
+  });
+  assert(res.status === 409 || res.status === 404, `status ${res.status}`);
+  return String(res.status);
+});
+
+await check('a prompt cannot be swapped in after it was priced', async () => {
+  // The cheap-quote-expensive-job swap. The prompt lives with the quote and dispatch has nowhere to
+  // put another one, so this asserts the registry ignores a smuggled field rather than honouring it.
+  const q = await c.quote(p.provider_id, SHORT);
+  const res = await fetch(`${opt.registry}/p/${p.provider_id}/job`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Buyer-Account': buyer },
+    body: JSON.stringify({ quote_id: q.quote_id, prompt: LONG, max_units: 1_000_000 }),
+  });
+  assert(res.status === 202, `status ${res.status}`);
+  const job = await res.json();
+  assert(job.agreed_units === q.estimate_units,
+    `job ran at ${job.agreed_units} units against a quote of ${q.estimate_units}`);
+  const done = await c.waitFor(job.job_id, { pollMs: 200 });
+  assert(done.price_tinybar <= q.price_tinybar,
+    `paid ${done.price_tinybar} against a quote of ${q.price_tinybar}`);
+  await c.collect(job.job_id);
+  return `ran the quoted prompt at ${job.agreed_price_tinybar} tinybar`;
+});
+
 await check('a replayed challenge from another job is refused', async () => {
-  const a = await c.dispatch(p.provider_id, 'Job A.', 100);
-  const b = await c.dispatch(p.provider_id, 'A rather longer job B, to make its price differ.', 100);
+  const a = await buy('Job A.');
+  const b = await buy('A rather longer job B, to make its price differ.');
   await c.waitFor(a.job_id, { pollMs: 200 });
   await c.waitFor(b.job_id, { pollMs: 200 });
 
@@ -178,14 +281,15 @@ let settled = null;
 await check('dispatch, execute, pay, receive — one call', async () => {
   const phases = [];
   const out = await c.delegate(
-    p.provider_id, 'Say hello in exactly five words.', 100,
+    p.provider_id, 'Say hello in exactly five words.',
     (e) => phases.push(e.phase), { pollMs: 200 },
   );
   assert(out.result, 'no result returned');
   assert(out.tx_id, 'no transaction id');
-  // `running` appears because dispatch now returns before the work does — real progress, not a
-  // heartbeat invented by the client.
-  assert(phases[0] === 'dispatching', `first phase was ${phases[0]}`);
+  // `quoting` first, because the price is agreed before anything is commissioned; `running` because
+  // dispatch returns before the work does — real progress, not a heartbeat invented by the client.
+  assert(phases[0] === 'quoting', `first phase was ${phases[0]}`);
+  assert(phases.includes('quoted'), 'the agreed price was never reported');
   assert(phases.includes('running'), 'no progress was reported while the job ran');
   assert(phases.at(-1) === 'paid', `last phase was ${phases.at(-1)}`);
   settled = out;
@@ -221,19 +325,52 @@ await check('the settlement resolves on the public mirror node', async () => {
 
 console.log('\nmetering and delivery');
 
-await check('an inflated unit report is clamped to the buyer ceiling', async () => {
-  // The echo backend reports roughly one unit per four characters, so a long prompt with a low
-  // ceiling forces the clamp.
-  const long = 'x'.repeat(2000);
-  const dispatched = await c.dispatch(p.provider_id, long, 10);
-  const job = await c.waitFor(dispatched.job_id, { pollMs: 200 });
-  assert(job.reported_units > job.priced_units, 'the provider did not exceed the ceiling');
-  assert(job.priced_units === 10, `priced ${job.priced_units}, want the ceiling of 10`);
-  assert(
-    job.price_tinybar === 10 * p.rate_per_unit,
-    `price ${job.price_tinybar} does not match the clamped units`,
-  );
-  return `reported ${job.reported_units}, charged for ${job.priced_units}`;
+const rigged = [];
+
+/** Start a provider with rigged answers and wait for it to announce its id. */
+function startRiggedProvider(account, args) {
+  const script = fileURLToPath(new URL('./rigged-provider.mjs', import.meta.url));
+  const proc = spawn(process.execPath, [script, '--registry', opt.registry, '--account', account, ...args]);
+  rigged.push(proc);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('it never connected')), 15_000);
+    proc.stdout.on('data', (b) => {
+      const m = /provider_id (\S+)/.exec(String(b));
+      if (m) {
+        clearTimeout(timer);
+        resolve(m[1]);
+      }
+    });
+    proc.stderr.on('data', (b) => {
+      clearTimeout(timer);
+      reject(new Error(String(b).slice(0, 200)));
+    });
+  });
+}
+
+await check('an inflated unit report is clamped to the quote the provider gave', async () => {
+  // A buyer can no longer produce an overrun by naming a low ceiling — the ceiling comes from the
+  // seller now. So the only party who can still create one is the seller, and this starts one that
+  // does: it quotes 10 units and then claims 5000. It must be paid for 10.
+  const seller = process.env.SELLER_ID;
+  if (!seller) return 'skipped (SELLER_ID not set)';
+
+  const liar = await startRiggedProvider(seller, ['--quote', '10', '--report', '5000']);
+  try {
+    const q = await c.quote(liar, 'Work I will underquote.');
+    assert(q.estimate_units === 10, `quoted ${q.estimate_units}, expected the rigged 10`);
+
+    const dispatched = await c.dispatch(liar, q.quote_id);
+    const job = await c.waitFor(dispatched.job_id, { pollMs: 200 });
+
+    assert(job.reported_units === 5000, `reported ${job.reported_units}`);
+    assert(job.priced_units === 10, `priced ${job.priced_units}, want the quoted 10`);
+    assert(job.price_tinybar === q.price_tinybar,
+      `price ${job.price_tinybar} does not match the quoted ${q.price_tinybar}`);
+    return `claimed ${job.reported_units}, paid for ${job.priced_units} — the overrun is the provider's loss`;
+  } finally {
+    rigged.pop()?.kill();
+  }
 });
 
 await check('the reported count is retained, not discarded', async () => {
@@ -265,7 +402,7 @@ await check('a job longer than the 180s validity window still settles', async ()
   // unless explicitly requested, since it takes over three minutes.
   if (!process.env.E2E_LONG_JOB) return 'skipped (set E2E_LONG_JOB=1 to run, ~3.5 min)';
   const started = Date.now();
-  const out = await c.delegate(p.provider_id, 'sleep:200', 100, () => {}, { pollMs: 2000 });
+  const out = await c.delegate(p.provider_id, 'sleep:200', () => {}, { pollMs: 2000 });
   const seconds = Math.round((Date.now() - started) / 1000);
   assert(out.tx_id, 'no settlement');
   assert(seconds > 180, `job took ${seconds}s, which does not exercise the window`);
@@ -275,7 +412,7 @@ await check('a job longer than the 180s validity window still settles', async ()
 await check('a job survives the caller walking away, and can be reclaimed by id', async () => {
   // Dispatch, drop the client, then come back with only the job id. Under the synchronous shape
   // this was impossible: the id never reached the caller until the work was already done.
-  const job = await c.dispatch(p.provider_id, 'Work that outlives its requester.', 100);
+  const job = await buy('Work that outlives its requester.');
   const fresh = createClient({ registry: opt.registry, accountId: buyer, privateKey: key });
   const done = await fresh.waitFor(job.job_id, { pollMs: 200 });
   assert(done.state === 'completed', `state ${done.state}`);
@@ -287,13 +424,38 @@ await check('an offline provider is refused rather than queued', async () => {
   const all = await c.findProviders({ onlineOnly: false });
   const offline = all.find((x) => !x.online);
   if (!offline) return 'skipped (no offline provider registered)';
-  const res = await fetch(`${opt.registry}/p/${offline.provider_id}/job`, {
+  // Refused at the quote, which is where a buyer now first touches a provider: there is nobody to
+  // ask for a price, so there is nothing to accept.
+  const res = await fetch(`${opt.registry}/p/${offline.provider_id}/quote`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'X-Buyer-Account': buyer },
-    body: JSON.stringify({ prompt: 'x', max_units: 10 }),
+    body: JSON.stringify({ prompt: 'x' }),
   });
   assert(res.status === 503, `status ${res.status}, want 503`);
   return '503';
+});
+
+await check('a provider may refuse work, and refusing is not failing', async () => {
+  // The echo backend takes everything, so a refusing provider is started for this. A decline has to
+  // be visibly distinct from a failure: same transport, different meaning, and only one of them is
+  // the provider's fault.
+  const seller = process.env.SELLER_ID;
+  if (!seller) return 'skipped (SELLER_ID not set)';
+
+  const reason = 'I do not do image work';
+  const picky = await startRiggedProvider(seller, ['--decline', reason]);
+  try {
+    await c.quote(picky, 'Draw me a cat.');
+    throw new Error('the quote was accepted');
+  } catch (e) {
+    assert(e instanceof DeclinedError, `got ${e.name}: ${e.message}`);
+    assert(!(e instanceof ProviderError), 'a refusal was classed as a breakage');
+    assert(e.reason.includes(reason), `reason lost in transit: ${e.reason}`);
+    assert(e.providerId === picky, 'the decline did not name its provider');
+    return `${e.providerId} declined, reason intact`;
+  } finally {
+    rigged.pop()?.kill();
+  }
 });
 
 // --- summary ---------------------------------------------------------------

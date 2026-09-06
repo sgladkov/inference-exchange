@@ -22,7 +22,8 @@ nothing.
 
 So payment is deferred instead. Dispatch is free and returns a job id immediately, while the work
 runs in the background; the buyer polls until it completes and pays at collect, for actual usage,
-bounded by a ceiling it declared up front. No transaction is in flight while the work runs.
+bounded by the price the provider quoted for that exact prompt. No transaction is in flight while
+the work runs.
 
 **Verified:** a 200-second job — past the window — dispatches, completes and settles. The payment
 round trip is about two seconds at the very end.
@@ -30,7 +31,7 @@ round trip is about two seconds at the very end.
 What that buys, and what it costs:
 
 - Job duration is unbounded. Real agentic work takes minutes.
-- Pricing is on **actual** usage rather than an estimate, still clamped to the buyer's ceiling.
+- Pricing is on **actual** usage rather than an estimate, clamped to the agreed quote.
 - A failed job is never billable — the error comes back free. That replaces the delivery-conditional
   guarantee lost by moving payment out from between verify and settle.
 - Free dispatch is an abuse surface, so an abandonment ratio bounds how many jobs a buyer may
@@ -65,13 +66,49 @@ That is why the Go side needs no Hedera SDK on the payment path.
 **Providers hold no private key.** Payments land at the account declared at registration; there is
 nothing to withdraw and nothing to sign with.
 
+## Quoting: the price comes from the party that can judge it
+
+A buyer cannot know what a prompt will cost. Token usage depends on the prompt *and* on the
+provider's backend, and only the provider can judge the pair — "write a haiku" and "analyse this
+design" differ enormously, and nothing about the text says by how much.
+
+So before any work is commissioned, the buyer asks:
+
+```
+POST /p/{provider}/quote  {prompt}  →  {quote_id, estimate_units, price_tinybar, expires_at}
+                                    →  or 409: the provider declined, and why
+```
+
+Three properties, each load-bearing:
+
+- **The quote is binding on the provider.** Whatever it estimates becomes the job's ceiling. Run
+  over and the difference comes out of its own margin. Estimation risk sits with the party able to
+  estimate.
+- **Either side may walk.** The provider can decline — too long, outside its competence, a buyer it
+  will not serve — and a decline is a first-class answer carrying a reason, never scored as a
+  failure. The buyer accepts by dispatching, or does not.
+- **The prompt lives with the quote and is never resent.** Dispatch carries a `quote_id` and nothing
+  else, so there is no cheap-quote-expensive-job swap to attempt.
+
+This replaced a buyer-declared `max_units` ceiling, which was a guess about someone else's backend
+— and with no floor beneath it, `max_units: 1` bought a full `claude-code` job costing the provider
+eight cents for three tinybar. The mirror image of the over-reporting the clamp defends against.
+
+**What binding quotes do not fix.** They close the free-work gap; they do not solve metering trust,
+they relocate it. Over-reporting past the quote now gains a provider nothing, so the incentive moves
+into the estimate itself: pad it, then report up to it. The clamp cannot see that, because the
+provider supplies both numbers. Two things check it, neither a guarantee — **competition**, which is
+why quoting is a separate call a buyer can make to several providers with the identical prompt, and
+**observed quote accuracy**, published per provider.
+
 ## Payment flow
 
 ```
-POST /p/{provider}/job          free · 202 with a job id, immediately
+POST /p/{provider}/quote        free · the provider prices this prompt, or declines
+POST /p/{provider}/job          free · {quote_id} · 202 with a job id, immediately
   └─ registry → provider over the open socket
      provider executes, reports units used
-     registry clamps units to the buyer's ceiling and prices them
+     registry clamps units to the quote and prices them
 
 GET  /p/job/{id}/status         free · running → completed, with the price
 
@@ -179,18 +216,21 @@ export MERCHANT_ID=0.0.xxxxx MERCHANT_KEY=0x...
 claude mcp add inference-exchange -- node packages/mcp/server.mjs
 ```
 
-Five tools:
+Six tools:
 
 | Tool | Does |
 | --- | --- |
 | `find_providers` | Who is online, at what price, claiming what |
-| `get_quote` | The ceiling for a task, before committing |
-| `delegate_task` | Dispatch, wait with progress, pay, return the result and its transaction id |
+| `get_quote` | What one provider would charge for this exact prompt, or why it will not take it |
+| `compare_quotes` | The same prompt priced by several providers at once, cheapest first |
+| `delegate_task` | Quote, accept, wait with progress, pay, return the result and its transaction id |
 | `why_blocked` | Read the decision log for your account — refusals, the rule behind each, and settlements |
 | `spend_report` | Settled spend and the headroom under every limit, by provider |
 
-A failed job costs nothing, and every refusal comes back as advice rather than an exception, so the
-agent is told whether to stop, try another provider, or retry later.
+A failed job costs nothing, a declined one costs nothing, and every refusal comes back as advice
+rather than an exception, so the agent is told whether to stop, try another provider, or retry
+later. `compare_quotes` exists because a padded estimate is invisible on its own and obvious beside
+a competitor's price for the same task.
 
 The last two differ in what they can be trusted for, and say so. `why_blocked` reads the chain, so
 the exchange cannot misreport what it decided. `spend_report` reads the registry, because budgets
@@ -232,14 +272,16 @@ Five things follow, and each one bites.
 **Tiny delegations are uneconomic.** The floor dominates anything short, so this backend suits real
 tasks rather than one-liners.
 
-**Ceilings belong on real jobs, not floors.** `get_quote` before dispatching, and size `max_units`
-against what the model actually uses — especially on opus, which is the variable one.
+**Only the provider can price this.** The floor, the model tier and the twofold run-to-run variance
+on opus are all facts about the seller's backend that a buyer has no way to see. This table is why
+quoting is a round trip to the provider rather than arithmetic on the buyer's side — and why the
+estimator adds an output allowance on top of the floor instead of pricing the prompt alone.
 
 **Units bill on tokens, not cost.** Token totals are identical cold and warm; cost is three to five
 times higher cold. Cache warmth is something a buyer can neither see nor control, so billing it
-would make the same work cost wildly different amounts. Billing tokens keeps a buyer's ceiling
-meaning the same thing and leaves cache variance with the provider, which is the party that
-controls it. The daemon logs cost per job so a provider can watch its own margin.
+would make the same work cost wildly different amounts. Billing tokens keeps a quote meaning the
+same thing every time and leaves cache variance with the provider, which is the party that controls
+it. The daemon logs cost per job so a provider can watch its own margin.
 
 **Rates must be set per model.** Cost rises 3.8× from haiku to opus while tokens rise only 1.38×,
 so one flat rate across models underprices the expensive ones badly. Cost per token, normalised to
@@ -274,10 +316,23 @@ settlement with `fetch` intercepted, so the tests assert against what the refere
 actually emits rather than against documentation. The challenge round-trip is byte-for-byte.
 
 `demo/e2e.mjs` runs every denial before its matching success, so a pass means the control fired
-rather than that the happy path happened to work.
+rather than that the happy path happened to work. Two of its checks need a provider that misbehaves
+on cue, so it starts `demo/rigged-provider.mjs` — one that quotes 10 units and then claims 5000, and
+one that declines everything. Both outcomes are things an honest backend will not produce on
+request, and both are load-bearing: the first is what a binding quote is *for*, and the second must
+stay distinguishable from a failure.
+
+Measured live, 6 Sept 2026: a `--model haiku` provider quoted 11,821 units for a one-sentence
+question and used 10,397. Settled
+[0.0.7162784@1788712569.503547621](https://hashscan.io/testnet/transaction/0.0.7162784@1788712569.503547621).
 
 ## Known limits
 
+- **A padded quote is not detectable from one job.** A binding quote stops a provider billing past
+  what it agreed to, but the agreement is its own number. Competition and published quote accuracy
+  are the checks; neither is a proof.
+- **Quoting is free, and estimating costs the provider something.** A buyer can quote without ever
+  accepting. Per-buyer quote quotas are not implemented yet.
 - **Buyer identity is asserted at dispatch, not authenticated.** It is checked where it matters:
   the facilitator reports who actually signed, and a mismatch is refused. So a caller can attribute
   a *free* job to another account, but cannot spend their money or read their results.

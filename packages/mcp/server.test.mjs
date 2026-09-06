@@ -5,6 +5,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { buildServer, explain, reply, configFromEnv } from './server.mjs';
 import {
   PolicyError,
+  DeclinedError,
+  QuoteError,
   ProviderError,
   UpstreamError,
   ExpiredError,
@@ -17,6 +19,7 @@ import {
 const stubClient = (overrides = {}) => ({
   findProviders: async () => [],
   quote: async () => ({}),
+  quoteAll: async () => [],
   delegate: async () => ({}),
   decisions: async () => ({ topicId: '0.0.999', records: [] }),
   spend: async () => SPEND,
@@ -51,6 +54,7 @@ test('exposes exactly the tools that work today', async () => {
   const mcp = await connect(stubClient());
   const names = (await mcp.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
+    'compare_quotes',
     'delegate_task',
     'find_providers',
     'get_quote',
@@ -68,12 +72,19 @@ test('every tool advertises an introspectable schema', async () => {
   }
 });
 
-test('delegate_task requires the fields that bound spending', async () => {
+test('delegate_task asks for the task, not for a guess at its size', async () => {
   const mcp = await connect(stubClient());
   const tool = (await mcp.listTools()).tools.find((t) => t.name === 'delegate_task');
-  assert.deepEqual(tool.inputSchema.required.sort(), ['max_units', 'prompt', 'provider_id']);
-  // The ceiling must not be optional: it is the buyer's only metering defence.
-  assert.ok(tool.inputSchema.properties.max_units);
+  assert.deepEqual(tool.inputSchema.required.sort(), ['prompt', 'provider_id']);
+  // A caller-supplied ceiling was a guess about someone else's backend, and with no floor under it
+  // a low guess bought real work for nothing. The provider's own quote replaced it.
+  assert.equal(tool.inputSchema.properties.max_units, undefined);
+});
+
+test('get_quote prices a specific prompt rather than a quantity of units', async () => {
+  const mcp = await connect(stubClient());
+  const tool = (await mcp.listTools()).tools.find((t) => t.name === 'get_quote');
+  assert.deepEqual(tool.inputSchema.required.sort(), ['prompt', 'provider_id']);
 });
 
 // --- find_providers --------------------------------------------------------
@@ -118,21 +129,107 @@ test('find_providers says so plainly when nobody is online', async () => {
 
 // --- get_quote -------------------------------------------------------------
 
-test('get_quote presents the price as a ceiling, not a prediction', async () => {
+test('get_quote sends the prompt and reports the binding price', async () => {
+  let seen;
   const mcp = await connect(
     stubClient({
-      quote: async () => ({
-        provider_id: 'prov-1',
-        rate_per_unit: 3,
-        max_units: 100,
-        max_price_tinybar: 300,
-        pay_to: '0.0.5005',
-      }),
+      quote: async (pid, prompt) => {
+        seen = { pid, prompt };
+        return {
+          quote_id: 'q-1',
+          provider_id: 'prov-1',
+          rate_per_unit: 3,
+          estimate_units: 14200,
+          price_tinybar: 42600,
+          expires_at: '2026-09-06T12:00:00Z',
+        };
+      },
     }),
   );
-  const text = textOf(await mcp.callTool({ name: 'get_quote', arguments: { provider_id: 'prov-1', max_units: 100 } }));
-  assert.match(text, /at most 300 tinybar/i);
-  assert.match(text, /often lower/i);
+  const text = textOf(
+    await mcp.callTool({
+      name: 'get_quote',
+      arguments: { provider_id: 'prov-1', prompt: 'analyse this design' },
+    }),
+  );
+  assert.equal(seen.prompt, 'analyse this design', 'the provider must price the actual task');
+  assert.match(text, /42600 tinybar/);
+  assert.match(text, /q-1/);
+  // The agent has to know an overrun is not its problem, or it will pad its own request instead.
+  assert.match(text, /binding/i);
+});
+
+test('get_quote hands a decline back as an answer, naming the provider', async () => {
+  const mcp = await connect(
+    stubClient({
+      quote: async () => {
+        throw new DeclinedError('PROVIDER_DECLINED {"reason":"beyond my context window"}', 'prov-1');
+      },
+    }),
+  );
+  const res = await mcp.callTool({
+    name: 'get_quote',
+    arguments: { provider_id: 'prov-1', prompt: 'p' },
+  });
+  assert.ok(!res.isError);
+  const text = textOf(res);
+  assert.match(text, /declined/i);
+  assert.match(text, /prov-1/);
+  assert.match(text, /nothing was charged/i);
+  // The next move is another provider, not another attempt at this one.
+  assert.match(text, /different provider/i);
+});
+
+// --- compare_quotes --------------------------------------------------------
+
+test('compare_quotes ranks real prices and keeps refusals visible', async () => {
+  let seen;
+  const mcp = await connect(
+    stubClient({
+      quoteAll: async (ids, prompt) => {
+        seen = { ids, prompt };
+        return [
+          { provider_id: 'prov-1', quote_id: 'q-1', estimate_units: 200, price_tinybar: 600, rate_per_unit: 3 },
+          { provider_id: 'prov-2', declined: true, reason: 'PROVIDER_DECLINED {"reason":"too long"}' },
+          { provider_id: 'prov-3', quote_id: 'q-3', estimate_units: 80, price_tinybar: 400, rate_per_unit: 5 },
+        ];
+      },
+    }),
+  );
+  const text = textOf(
+    await mcp.callTool({
+      name: 'compare_quotes',
+      arguments: { provider_ids: ['prov-1', 'prov-2', 'prov-3'], prompt: 'one task' },
+    }),
+  );
+
+  assert.deepEqual(seen.ids, ['prov-1', 'prov-2', 'prov-3']);
+  assert.equal(seen.prompt, 'one task');
+  // Cheapest first, and cheapest is not the lowest rate: prov-3 charges more per unit and still
+  // wins, which is exactly the comparison a per-unit rate card cannot make.
+  assert.ok(text.indexOf('prov-3') < text.indexOf('prov-1'), text);
+  assert.match(text, /Cheapest is prov-3 at 400 tinybar/);
+  assert.match(text, /prov-2\s+no quote/);
+  assert.match(text, /Price is not quality/i);
+});
+
+test('compare_quotes says plainly when nobody would take the work', async () => {
+  const mcp = await connect(
+    stubClient({
+      quoteAll: async () => [
+        { provider_id: 'prov-1', declined: true, reason: 'too long' },
+        { provider_id: 'prov-2', declined: true, reason: 'unproven buyer' },
+      ],
+    }),
+  );
+  const text = textOf(
+    await mcp.callTool({
+      name: 'compare_quotes',
+      arguments: { provider_ids: ['prov-1', 'prov-2'], prompt: 'p' },
+    }),
+  );
+  assert.match(text, /No provider quoted/i);
+  assert.match(text, /unproven buyer/);
 });
 
 // --- delegate_task ---------------------------------------------------------
@@ -152,7 +249,7 @@ test('delegate_task returns the result with its settlement', async () => {
   const text = textOf(
     await mcp.callTool({
       name: 'delegate_task',
-      arguments: { provider_id: 'prov-1', prompt: 'do it', max_units: 100 },
+      arguments: { provider_id: 'prov-1', prompt: 'do it' },
     }),
   );
   assert.match(text, /the work product/);
@@ -161,9 +258,9 @@ test('delegate_task returns the result with its settlement', async () => {
   assert.match(text, /hashscan\.io/, 'the agent should be able to hand its user a verifiable link');
 });
 
-// The clamp is invisible unless it is said out loud, and it is the one moment the buyer's ceiling
-// demonstrably did something.
-test('delegate_task reports when the ceiling held', async () => {
+// An overrun is invisible unless it is said out loud, and it is the one moment the binding quote
+// demonstrably did something: the provider ate the difference.
+test('delegate_task reports an overrun the provider absorbed', async () => {
   const mcp = await connect(
     stubClient({
       delegate: async () => ({
@@ -178,30 +275,51 @@ test('delegate_task reports when the ceiling held', async () => {
   const text = textOf(
     await mcp.callTool({
       name: 'delegate_task',
-      arguments: { provider_id: 'prov-1', prompt: 'p', max_units: 10 },
+      arguments: { provider_id: 'prov-1', prompt: 'p' },
     }),
   );
-  assert.match(text, /reported 5000 units/);
-  assert.match(text, /charged for 10/);
-  assert.match(text, /ceiling held/);
+  assert.match(text, /used 5000 units/);
+  assert.match(text, /quoted 10/);
+  assert.match(text, /absorbed the overrun/);
 });
 
-test('delegate_task forwards the ceiling and the wait limit', async () => {
+test('delegate_task forwards the prompt and the wait limit, and nothing else', async () => {
   let args;
   const mcp = await connect(
     stubClient({
-      delegate: async (pid, prompt, maxUnits, _onProgress, opts) => {
-        args = { pid, prompt, maxUnits, opts };
+      delegate: async (pid, prompt, onProgress, opts) => {
+        args = { pid, prompt, onProgress, opts };
         return { result: 'r', price_tinybar: 1, priced_units: 1, reported_units: 1, tx_id: 't' };
       },
     }),
   );
   await mcp.callTool({
     name: 'delegate_task',
-    arguments: { provider_id: 'prov-1', prompt: 'p', max_units: 42, wait_seconds: 30 },
+    arguments: { provider_id: 'prov-1', prompt: 'p', wait_seconds: 30 },
   });
-  assert.equal(args.maxUnits, 42);
+  assert.equal(args.pid, 'prov-1');
+  assert.equal(args.prompt, 'p');
+  assert.equal(typeof args.onProgress, 'function', 'progress must survive the signature change');
   assert.equal(args.opts.timeoutMs, 30_000);
+});
+
+test('delegate_task reports the agreed price alongside what was paid', async () => {
+  const mcp = await connect(
+    stubClient({
+      delegate: async (pid, prompt, onProgress) => {
+        onProgress({ phase: 'quoting', provider: pid });
+        onProgress({ phase: 'quoted', provider: pid, units: 100, price: 300 });
+        onProgress({ phase: 'paid', job: 'job-1' });
+        return { result: 'r', price_tinybar: 240, priced_units: 80, reported_units: 80, tx_id: 't' };
+      },
+    }),
+  );
+  const text = textOf(
+    await mcp.callTool({ name: 'delegate_task', arguments: { provider_id: 'prov-1', prompt: 'p' } }),
+  );
+  // Under the quote, not at it: the buyer pays for what was used, and can see it did.
+  assert.match(text, /Quoted 300 tinybar for 100 units/);
+  assert.match(text, /Paid 240 tinybar for 80 units/);
 });
 
 // --- failures are answers, not exceptions ----------------------------------
@@ -215,6 +333,8 @@ test('every failure class returns advice rather than throwing', async () => {
     [new UpstreamError('FIREWALL_UPSTREAM_UNAVAILABLE {"phase":"settle"}'), /nothing settled/i, /retry/i],
     [new ExpiredError('JOB_EXPIRED {}', 'job-1'), /expired/i, /again/i],
     [new StillRunningError('slow', 'job-9', 'running'), /has not failed/i, /job-9/],
+    [new DeclinedError('PROVIDER_DECLINED {"reason":"no"}', 'prov-1'), /declined/i, /quote a different provider/i],
+    [new QuoteError('QUOTE_INVALID {"detail":"expired"}', 'q-1'), /no longer usable/i, /fresh quote/i],
   ];
 
   for (const [err, ...expected] of cases) {
@@ -227,7 +347,7 @@ test('every failure class returns advice rather than throwing', async () => {
     );
     const res = await mcp.callTool({
       name: 'delegate_task',
-      arguments: { provider_id: 'prov-1', prompt: 'p', max_units: 10 },
+      arguments: { provider_id: 'prov-1', prompt: 'p' },
     });
     assert.ok(!res.isError, `${err.name} came back as a protocol error, not an answer`);
     const text = textOf(res);

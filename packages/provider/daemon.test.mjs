@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   runJob,
+  runQuote,
   validate,
   parseOptions,
   registrationBody,
@@ -14,7 +15,7 @@ import {
   INITIAL_BACKOFF,
   MAX_BACKOFF,
 } from './daemon.mjs';
-import { makeBackends } from './backends.mjs';
+import { makeBackends, makeEstimators } from './backends.mjs';
 
 const collect = () => {
   const sent = [];
@@ -101,7 +102,7 @@ test('runJob coerces a non-string result rather than sending a bad frame', async
   assert.equal(typeof sent[1].result, 'string');
 });
 
-test('runJob reports an over-ceiling count without altering it', async () => {
+test('runJob reports an over-quote count without altering it', async () => {
   const [sent, send] = collect();
   const lines = [];
   await runJob(async () => ({ result: 'r', units: 5000 }), send, {
@@ -111,9 +112,110 @@ test('runJob reports an over-ceiling count without altering it', async () => {
   }, (m) => lines.push(m));
 
   // The daemon reports honestly and lets the registry clamp: silently trimming here would destroy
-  // the only cross-call evidence of inflation.
+  // the only cross-call evidence of inflation. The overrun is now this provider's own loss, which
+  // is the operator's cue that its estimator is wrong.
   assert.equal(sent[1].units, 5000);
-  assert.match(lines.join('\n'), /ceiling/);
+  assert.match(lines.join('\n'), /absorb/);
+});
+
+// --- runQuote: pricing without committing to anything ----------------------
+
+test('runQuote answers with an integer estimate against the quote id', async () => {
+  const [sent, send] = collect();
+  await runQuote(async (prompt) => prompt.length * 1.5, send, {
+    quote_id: 'q-1',
+    prompt: 'abcd',
+  });
+
+  assert.deepEqual(sent, [{ type: 'quoted', quote_id: 'q-1', units: 6 }]);
+});
+
+test('runQuote rounds up, because a fractional unit is still a unit we pay for', async () => {
+  const [sent, send] = collect();
+  await runQuote(async () => 10.01, send, { quote_id: 'q-1', prompt: 'p' });
+  assert.equal(sent[0].units, 11);
+});
+
+test('a thrown estimator is a decline, carrying its reason', async () => {
+  // This is how a backend refuses work: the estimator throws, and the registry hears "no" rather
+  // than "broken". Providers get to be picky without it counting against them.
+  const [sent, send] = collect();
+  await assert.doesNotReject(() =>
+    runQuote(
+      async () => {
+        throw new Error('prompt exceeds my context window');
+      },
+      send,
+      { quote_id: 'q-1', prompt: 'x'.repeat(9_000_000) },
+    ),
+  );
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, 'declined');
+  assert.equal(sent[0].quote_id, 'q-1');
+  assert.match(sent[0].error, /exceeds my context window/);
+  assert.equal(sent[0].units, undefined, 'a decline must not carry a price');
+});
+
+test('a nonsense estimate is a decline rather than a free job', async () => {
+  // A zero or NaN estimate would price real work at nothing. Refusing is the safe reading: the
+  // buyer can quote elsewhere, and nobody works for free by arithmetic accident.
+  for (const bad of [0, -5, NaN, Infinity, undefined, null, 'lots']) {
+    const [sent, send] = collect();
+    await runQuote(async () => bad, send, { quote_id: 'q-1', prompt: 'p' });
+    assert.equal(sent[0].type, 'declined', `estimate ${String(bad)} was quoted, not declined`);
+  }
+});
+
+test('runQuote always answers exactly one frame', async () => {
+  // Silence would park the registry's quote call until it times out, and the buyer with it.
+  for (const estimate of [
+    async () => 42,
+    async () => {
+      throw new Error('no');
+    },
+    async () => {
+      throw 'a bare string';
+    },
+    async () => 0,
+  ]) {
+    const [sent, send] = collect();
+    await runQuote(estimate, send, { quote_id: 'q-1', prompt: 'p' });
+    assert.equal(sent.length, 1, `got ${JSON.stringify(sent)}`);
+    assert.ok(['quoted', 'declined'].includes(sent[0].type));
+  }
+});
+
+// --- estimators ------------------------------------------------------------
+
+test('every backend has an estimator, or it cannot be sold from', () => {
+  const backends = Object.keys(makeBackends());
+  const estimators = makeEstimators();
+  for (const name of backends) {
+    assert.equal(typeof estimators[name], 'function', `${name} has no estimator`);
+  }
+});
+
+test('a longer prompt costs more than a short one, from the same backend', async () => {
+  const estimators = makeEstimators({ backend: 'claude-code', model: 'sonnet' });
+  const short = await estimators['claude-code']('hi');
+  const long = await estimators['claude-code']('x'.repeat(40_000));
+  assert.ok(long > short, `${long} should exceed ${short}`);
+});
+
+test('the claude-code estimate clears the measured floor even for a two-character prompt', () => {
+  // The floor is the whole reason a static per-unit rate could not work: a trivial prompt still
+  // costs ~14,000 tokens of agent context, and pricing it by prompt length alone sells at a loss.
+  const estimators = makeEstimators({ backend: 'claude-code', model: 'opus' });
+  assert.ok(estimators['claude-code']('hi') > 14_196, 'opus quote fell below its own floor');
+});
+
+test('an unknown model is priced as the most expensive one', () => {
+  // Defaulting low would quote below cost for the flagship. Being wrong in the provider's favour
+  // is a lost sale; being wrong the other way is unpaid work.
+  const guessed = makeEstimators({ model: 'some-future-model' })['claude-code']('hi');
+  const opus = makeEstimators({ model: 'opus' })['claude-code']('hi');
+  assert.equal(guessed, opus);
 });
 
 // --- options ---------------------------------------------------------------

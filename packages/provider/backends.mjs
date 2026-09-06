@@ -8,6 +8,24 @@
 // registration, wire protocol and payment path are identical regardless.
 import { spawn } from 'node:child_process';
 
+/**
+ * What a headless Claude Code invocation costs before it does anything, per model.
+ *
+ * Measured 6 Sept 2026, same prompt each model, and stable across cache warmth. Almost all of it is
+ * the agent's own context, which is why a short prompt does not make a job cheap and why any
+ * estimate has to start here rather than at zero.
+ */
+export const CLAUDE_CODE_FLOOR = { haiku: 10307, sonnet: 13396, opus: 14196 };
+
+/** The floor for a model name or alias, defaulting to the largest so an estimate is never low. */
+export function floorFor(model) {
+  const m = String(model ?? '').toLowerCase();
+  for (const [alias, floor] of Object.entries(CLAUDE_CODE_FLOOR)) {
+    if (m.includes(alias)) return floor;
+  }
+  return CLAUDE_CODE_FLOOR.opus;
+}
+
 /** Rough token estimate for backends that do not report usage of their own. */
 export function estimateUnits(...texts) {
   const chars = texts.reduce((n, t) => n + String(t ?? '').length, 0);
@@ -75,6 +93,31 @@ export function claudeCodeUnits(parsed) {
     (u.cache_creation_input_tokens ?? 0) +
     (u.cache_read_input_tokens ?? 0)
   );
+}
+
+/**
+ * Estimators: what a provider answers a quote with.
+ *
+ * These must be **cheap**. A quote is reachable before any payment, so an estimator that did real
+ * work would turn quoting into the free-work attack quoting exists to close. Arithmetic, or at most
+ * one small API call — never the job itself.
+ *
+ * Throwing declines the work. That is a first-class answer, not an error: a provider refusing a job
+ * it does not want must never be scored as having failed one.
+ */
+export function makeEstimators(opt = {}) {
+  const outputAllowance = Number(opt['output-allowance'] ?? 1500);
+
+  return {
+    echo: (prompt) => estimateUnits(prompt),
+
+    // Floor dominates, so the prompt is a rounding error on anything short. Being explicit about
+    // that is what stops a provider pricing itself below its own cost.
+    'claude-code': (prompt) => floorFor(opt.model) + estimateUnits(prompt) + outputAllowance,
+
+    anthropic: (prompt) => estimateUnits(prompt) + outputAllowance,
+    ollama: (prompt) => estimateUnits(prompt) + outputAllowance,
+  };
 }
 
 export function makeBackends(opt = {}, deps = {}) {

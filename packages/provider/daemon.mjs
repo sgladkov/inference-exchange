@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeBackends } from './backends.mjs';
+import { makeBackends, makeEstimators } from './backends.mjs';
 
 export const MAX_BACKOFF = 30_000;
 export const INITIAL_BACKOFF = 1000;
@@ -48,6 +48,11 @@ export function usage(backendNames) {
   --provider-id <id>    reconnect as an existing registration
   --tools none|all      whether a buyer's prompt may use tools    (default none)
   --workdir <path>      where backends run (default: a fresh temp directory)
+  --output-allowance <n>  units to add to a quote for the answer  (default 1500)
+
+Quotes are binding: whatever this daemon estimates becomes the job's ceiling, and work beyond it
+comes out of your margin. --output-allowance is what covers the answer, since only the prompt can
+be measured before the job runs.
 
 No private key is needed or accepted: payments settle straight to --account.`;
 }
@@ -96,15 +101,41 @@ export function nextBackoff(current) {
  * frame, because that is what leaves the buyer unbilled — a throw here would strand them waiting
  * for a result that is never coming, holding a job the registry believes is still running.
  */
+/**
+ * Price one prompt and answer the quote.
+ *
+ * Like runJob, this never throws and never goes silent: a quote left unanswered strands the buyer
+ * and the registry until a timeout. A thrown estimator is a *decline* — the provider looked at the
+ * work and said no — which is a legitimate answer and must not reach the registry as a failure.
+ */
+export async function runQuote(estimate, send, frame, log = () => {}) {
+  try {
+    const units = await estimate(frame.prompt);
+    if (!Number.isFinite(units) || units <= 0) {
+      throw new Error(`estimator returned ${units}`);
+    }
+    const rounded = Math.ceil(units);
+    send({ type: 'quoted', quote_id: frame.quote_id, units: rounded });
+    log(`  quoted ${rounded} units`);
+  } catch (e) {
+    const reason = String(e?.message ?? e).slice(0, 200);
+    send({ type: 'declined', quote_id: frame.quote_id, error: reason });
+    log(`  declined: ${reason}`);
+  }
+}
+
 export async function runJob(execute, send, frame, log = () => {}) {
   const started = Date.now();
   send({ type: 'accepted', job_id: frame.job_id });
   try {
     const { result, units, costUSD } = await execute(frame.prompt, frame.max_units);
     send({ type: 'result', job_id: frame.job_id, result: String(result ?? ''), units });
+    // The ceiling is our own quote, so an overrun is our own mispricing: the registry bills the
+    // quoted amount and the difference comes out of this provider's margin. Worth saying loudly —
+    // it is the signal that the estimator needs adjusting.
     const over =
       units > frame.max_units
-        ? `  (over the buyer's ceiling of ${frame.max_units}; it will be clamped)`
+        ? `  (over our quote of ${frame.max_units}; we absorb the difference)`
         : '';
     // Cost is the provider's own concern, not the buyer's price, so it is logged here rather than
     // sent. A backend that knows what a job cost lets its operator see the margin per job.
@@ -196,6 +227,7 @@ async function main() {
   }
 
   const execute = backends[opt.backend];
+  const estimate = makeEstimators(opt)[opt.backend];
   let providerId = opt['provider-id'];
   let backoff = INITIAL_BACKOFF;
 
@@ -236,9 +268,14 @@ async function main() {
       } catch {
         return;
       }
+      // Neither is awaited: the read loop must stay responsive while work is in progress.
+      if (f.type === 'quote') {
+        console.error(`quote ${f.quote_id}  "${String(f.prompt).slice(0, 60)}"`);
+        runQuote(estimate, send, f, (m) => console.error(m));
+        return;
+      }
       if (f.type !== 'job') return;
-      console.error(`job ${f.job_id}  max_units=${f.max_units}  "${String(f.prompt).slice(0, 60)}"`);
-      // Deliberately not awaited: the read loop must stay responsive while work is in progress.
+      console.error(`job ${f.job_id}  agreed=${f.max_units}u  "${String(f.prompt).slice(0, 60)}"`);
       runJob(execute, send, f, (m) => console.error(m));
     });
 

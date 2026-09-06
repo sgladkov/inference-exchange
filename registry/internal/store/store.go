@@ -20,6 +20,9 @@ var (
 	ErrNoSuchProvider = errors.New("no such provider")
 	ErrNoSuchJob      = errors.New("no such job")
 	ErrNotYours       = errors.New("job belongs to a different buyer")
+	ErrNoSuchQuote    = errors.New("no such quote")
+	ErrQuoteExpired   = errors.New("quote has expired")
+	ErrQuoteUsed      = errors.New("quote has already been dispatched")
 )
 
 // Provider is a registered seller. It never listens on a port: it dials the registry and holds the
@@ -67,6 +70,27 @@ func (s JobState) Terminal() bool {
 	return s == JobCollected || s == JobFailed || s == JobExpired
 }
 
+// Quote is a provider's price for one specific prompt, binding on the provider once accepted.
+//
+// The prompt is stored here rather than resent at dispatch. Letting a buyer supply it again would
+// allow a swap — quote a cheap prompt, dispatch an expensive one — so the quote binds the exact text
+// it priced.
+//
+// EstimateUnits becomes the job's ceiling. That is what makes the quote binding: a provider that
+// underestimates absorbs the overrun, which puts estimation risk on the only party able to judge it.
+type Quote struct {
+	ID            string    `json:"quote_id"`
+	ProviderID    string    `json:"provider_id"`
+	BuyerAccount  string    `json:"-"`
+	Prompt        string    `json:"-"`
+	EstimateUnits int64     `json:"estimate_units"`
+	PriceTinybar  int64     `json:"price_tinybar"`
+	RatePerUnit   int64     `json:"rate_per_unit"`
+	CreatedAt     time.Time `json:"created_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	JobID         string    `json:"job_id,omitempty"` // set once spent, so it cannot be spent twice
+}
+
 // Job is one delegated task.
 //
 // MaxUnits is the buyer's ceiling, declared at dispatch and never quoted by the provider. It is
@@ -78,7 +102,8 @@ type Job struct {
 	ProviderID   string   `json:"provider_id"`
 	BuyerAccount string   `json:"buyer"`
 	Prompt       string   `json:"-"`
-	MaxUnits     int64    `json:"max_units"`
+	QuoteID      string   `json:"quote_id"`
+	MaxUnits     int64    `json:"max_units"` // the accepted quote's estimate, not a buyer's guess
 	State        JobState `json:"state"`
 
 	// Reported is what the provider says it used. Priced is what the buyer is charged, which is
@@ -107,8 +132,10 @@ type Store struct {
 	mu        sync.RWMutex
 	providers map[string]*Provider
 	jobs      map[string]*Job
+	quotes    map[string]*Quote
 	byBuyer   map[string][]string // buyer account → job ids, for budget and abandonment checks
 	ttl       time.Duration
+	quoteTTL  time.Duration
 }
 
 func New(resultTTL time.Duration) *Store {
@@ -118,9 +145,20 @@ func New(resultTTL time.Duration) *Store {
 	return &Store{
 		providers: map[string]*Provider{},
 		jobs:      map[string]*Job{},
+		quotes:    map[string]*Quote{},
 		byBuyer:   map[string][]string{},
 		ttl:       resultTTL,
+		// Short by design: a quote held across a rate or policy change would be a price the
+		// provider no longer offers.
+		quoteTTL: 5 * time.Minute,
 	}
+}
+
+// SetQuoteTTL overrides how long a quote stays spendable.
+func (s *Store) SetQuoteTTL(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quoteTTL = d
 }
 
 func id(prefix string) string {
@@ -189,6 +227,78 @@ func (s *Store) SetOnline(pid string, online bool) {
 		p.Online = online
 		p.LastSeen = time.Now()
 	}
+}
+
+// --- quotes ----------------------------------------------------------------
+
+// CreateQuote records a provider's price for one prompt.
+func (s *Store) CreateQuote(providerID, buyer, prompt string, units, rate int64) (*Quote, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.providers[providerID]; !ok {
+		return nil, ErrNoSuchProvider
+	}
+	now := time.Now()
+	q := &Quote{
+		ID: id("qt"), ProviderID: providerID, BuyerAccount: buyer, Prompt: prompt,
+		EstimateUnits: units, PriceTinybar: units * rate, RatePerUnit: rate,
+		CreatedAt: now, ExpiresAt: now.Add(s.quoteTTL),
+	}
+	s.quotes[q.ID] = q
+	return q, nil
+}
+
+// Quote returns a quote, enforcing that the caller owns it.
+func (s *Store) Quote(quoteID, buyer string) (*Quote, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	q, ok := s.quotes[quoteID]
+	if !ok {
+		return nil, ErrNoSuchQuote
+	}
+	if buyer != "" && q.BuyerAccount != buyer {
+		// Deliberately the same error as an unknown quote: whether someone else holds this id is
+		// not a fact worth confirming to a stranger.
+		return nil, ErrNoSuchQuote
+	}
+	cp := *q
+	return &cp, nil
+}
+
+// SpendQuote turns a quote into a job, atomically, so one quote can buy exactly one job.
+//
+// Expiry and reuse are checked under the same lock that creates the job. Checking them separately
+// would leave a window in which two concurrent dispatches both pass.
+func (s *Store) SpendQuote(quoteID, buyer string) (*Job, *Quote, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	q, ok := s.quotes[quoteID]
+	if !ok || (buyer != "" && q.BuyerAccount != buyer) {
+		return nil, nil, ErrNoSuchQuote
+	}
+	if q.JobID != "" {
+		return nil, nil, ErrQuoteUsed
+	}
+	if time.Now().After(q.ExpiresAt) {
+		return nil, nil, ErrQuoteExpired
+	}
+	if _, ok := s.providers[q.ProviderID]; !ok {
+		return nil, nil, ErrNoSuchProvider
+	}
+
+	now := time.Now()
+	j := &Job{
+		ID: id("job"), ProviderID: q.ProviderID, BuyerAccount: q.BuyerAccount,
+		Prompt: q.Prompt, MaxUnits: q.EstimateUnits, QuoteID: q.ID, State: JobDispatched,
+		CreatedAt: now, ExpiresAt: now.Add(s.ttl),
+	}
+	s.jobs[j.ID] = j
+	s.byBuyer[q.BuyerAccount] = append(s.byBuyer[q.BuyerAccount], j.ID)
+	q.JobID = j.ID
+
+	jc, qc := *j, *q
+	return &jc, &qc, nil
 }
 
 // --- jobs ------------------------------------------------------------------

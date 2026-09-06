@@ -57,12 +57,12 @@ func connectProvider(t *testing.T, s *server, rate int64, reply func(hub.Frame) 
 }
 
 func answerWith(result string, units int64) func(hub.Frame) *hub.Frame {
-	return func(f hub.Frame) *hub.Frame {
+	return quotesAt(units, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: result, Units: units}
-	}
+	})
 }
 
 func dispatch(t *testing.T, s *server, pid string, body any, buyer string) *httptest.ResponseRecorder {
@@ -72,6 +72,52 @@ func dispatch(t *testing.T, s *server, pid string, body any, buyer string) *http
 		h[buyerHeader] = buyer
 	}
 	return do(t, s, "POST", "/p/"+pid+"/job", body, h)
+}
+
+func askQuote(t *testing.T, s *server, pid, prompt, buyer string) *httptest.ResponseRecorder {
+	t.Helper()
+	h := map[string]string{}
+	if buyer != "" {
+		h[buyerHeader] = buyer
+	}
+	return do(t, s, "POST", "/p/"+pid+"/quote", map[string]any{"prompt": prompt}, h)
+}
+
+// quoteAndDispatch walks the whole way in: ask a price, accept it, get a running job.
+func quoteAndDispatch(t *testing.T, s *server, pid, prompt string) string {
+	t.Helper()
+	qw := askQuote(t, s, pid, prompt, testBuyer)
+	if qw.Code != http.StatusOK {
+		t.Fatalf("quote: %d %s", qw.Code, qw.Body.String())
+	}
+	quoteID := decodeBody(t, qw)["quote_id"].(string)
+
+	w := dispatch(t, s, pid, map[string]any{"quote_id": quoteID}, testBuyer)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("dispatch: %d %s", w.Code, w.Body.String())
+	}
+	return decodeBody(t, w)["job_id"].(string)
+}
+
+// quotesAt makes a provider answer quotes with a fixed estimate, on top of whatever it does for
+// jobs. Every provider in these tests has to answer quotes now, since that is the only way in.
+func quotesAt(units int64, next func(hub.Frame) *hub.Frame) func(hub.Frame) *hub.Frame {
+	return func(f hub.Frame) *hub.Frame {
+		if f.Type == hub.FrameQuote {
+			return &hub.Frame{Type: hub.FrameQuoted, QuoteID: f.QuoteID, Units: units}
+		}
+		return next(f)
+	}
+}
+
+// declines makes a provider refuse every quote with a reason.
+func declines(reason string) func(hub.Frame) *hub.Frame {
+	return func(f hub.Frame) *hub.Frame {
+		if f.Type != hub.FrameQuote {
+			return nil
+		}
+		return &hub.Frame{Type: hub.FrameDeclined, QuoteID: f.QuoteID, Error: reason}
+	}
 }
 
 func status(t *testing.T, s *server, jobID string) map[string]any {
@@ -104,17 +150,19 @@ func awaitTerminal(t *testing.T, s *server, jobID string) map[string]any {
 func TestDispatchReturnsBeforeTheWorkIsDone(t *testing.T) {
 	s := newTestServer(t)
 	release := make(chan struct{})
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(10, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		<-release
 		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "the work product", Units: 10}
-	})
+	}))
 	defer done()
 	defer close(release)
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
+	qw := askQuote(t, s, pid, "x", testBuyer)
+	quoteID := decodeBody(t, qw)["quote_id"].(string)
+	w := dispatch(t, s, pid, map[string]any{"quote_id": quoteID}, testBuyer)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("code = %d, want 202: %s", w.Code, w.Body.String())
 	}
@@ -148,8 +196,8 @@ func TestJobCompletesAndIsPricedOnStatus(t *testing.T) {
 	pid, done := connectProvider(t, s, 3, answerWith("the work product", 10))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
+	w := status(t, s, jobID)
 	st := awaitTerminal(t, s, jobID)
 
 	if st["state"] != string(store.JobCompleted) {
@@ -162,8 +210,8 @@ func TestJobCompletesAndIsPricedOnStatus(t *testing.T) {
 		t.Errorf("pricing = %v units / %v tinybar, want 10 and 30", st["priced_units"], st["price_tinybar"])
 	}
 	// Status is free, so it must not hand over what payment buys.
-	if body := w.Body.String(); strings.Contains(body, "the work product") {
-		t.Error("dispatch leaked the result")
+	if raw, _ := json.Marshal(w); strings.Contains(string(raw), "the work product") {
+		t.Error("status leaked the result while running")
 	}
 	if raw, _ := json.Marshal(st); strings.Contains(string(raw), "the work product") {
 		t.Error("status leaked the result before payment")
@@ -175,11 +223,15 @@ func TestJobCompletesAndIsPricedOnStatus(t *testing.T) {
 // must still be visible, since the aggregate is the only evidence of inflation.
 func TestDispatchClampsAnInflatedReport(t *testing.T) {
 	s := newTestServer(t)
-	pid, done := connectProvider(t, s, 3, answerWith("result", 1_000_000))
+	pid, done := connectProvider(t, s, 3, quotesAt(50, func(f hub.Frame) *hub.Frame {
+		if f.Type != hub.FrameJob {
+			return nil
+		}
+		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "result", Units: 1_000_000}
+	}))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 50}, testBuyer)
-	st := awaitTerminal(t, s, decodeBody(t, w)["job_id"].(string))
+	st := awaitTerminal(t, s, quoteAndDispatch(t, s, pid, "x"))
 
 	if st["reported_units"] != float64(1_000_000) {
 		t.Errorf("reported = %v, want the provider's raw claim retained", st["reported_units"])
@@ -196,19 +248,15 @@ func TestDispatchClampsAnInflatedReport(t *testing.T) {
 // sits between verify and settle, so this is what replaces that guarantee.
 func TestFailedJobIsFree(t *testing.T) {
 	s := newTestServer(t)
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(100, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		return &hub.Frame{Type: hub.FrameFailed, JobID: f.JobID, Error: "the backend exploded"}
-	})
+	}))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("code = %d, want 202", w.Code)
-	}
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
 	st := awaitTerminal(t, s, jobID)
 
 	if st["state"] != string(store.JobFailed) {
@@ -235,15 +283,14 @@ func TestFailedJobIsFree(t *testing.T) {
 func TestProviderDisconnectMidJobFailsTheJob(t *testing.T) {
 	s := newTestServer(t)
 	arrived := make(chan struct{})
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(100, func(f hub.Frame) *hub.Frame {
 		if f.Type == hub.FrameJob {
 			close(arrived)
 		}
 		return nil // take the job, then never answer
-	})
+	}))
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
 
 	<-arrived
 	done() // the provider vanishes
@@ -262,7 +309,7 @@ func TestDispatchRequiresBuyerHeader(t *testing.T) {
 	pid, done := connectProvider(t, s, 3, answerWith("r", 1))
 	defer done()
 
-	if w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 10}, ""); w.Code != http.StatusBadRequest {
+	if w := dispatch(t, s, pid, map[string]any{"quote_id": "qt-nope"}, ""); w.Code != http.StatusBadRequest {
 		t.Errorf("code = %d, want 400", w.Code)
 	}
 }
@@ -272,20 +319,23 @@ func TestDispatchValidation(t *testing.T) {
 	pid, done := connectProvider(t, s, 3, answerWith("r", 1))
 	defer done()
 
-	for _, tc := range []struct {
-		name string
-		body any
-	}{
-		{"no prompt", map[string]any{"max_units": 10}},
-		{"zero max_units", map[string]any{"prompt": "x", "max_units": 0}},
-		{"negative max_units", map[string]any{"prompt": "x", "max_units": -1}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if w := dispatch(t, s, pid, tc.body, testBuyer); w.Code != http.StatusBadRequest {
-				t.Errorf("code = %d, want 400", w.Code)
-			}
-		})
-	}
+	// A buyer can no longer name its own ceiling: the only way in is a quote the provider gave.
+	t.Run("no quote id", func(t *testing.T) {
+		if w := dispatch(t, s, pid, map[string]any{}, testBuyer); w.Code != http.StatusBadRequest {
+			t.Errorf("code = %d, want 400", w.Code)
+		}
+	})
+	t.Run("a prompt and a ceiling are not accepted", func(t *testing.T) {
+		w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 1}, testBuyer)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("code = %d, want 400 — naming your own ceiling is what the quote replaced", w.Code)
+		}
+	})
+	t.Run("unknown quote", func(t *testing.T) {
+		if w := dispatch(t, s, pid, map[string]any{"quote_id": "qt-nope"}, testBuyer); w.Code != http.StatusConflict {
+			t.Errorf("code = %d, want 409", w.Code)
+		}
+	})
 
 	t.Run("malformed json", func(t *testing.T) {
 		r := httptest.NewRequest("POST", "/p/"+pid+"/job", strings.NewReader("{not json"))
@@ -300,7 +350,7 @@ func TestDispatchValidation(t *testing.T) {
 
 func TestDispatchUnknownProvider(t *testing.T) {
 	s := newTestServer(t)
-	w := dispatch(t, s, "prov-nope", map[string]any{"prompt": "x", "max_units": 10}, testBuyer)
+	w := dispatch(t, s, "prov-nope", map[string]any{"quote_id": "qt-x"}, testBuyer)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("code = %d, want 404", w.Code)
 	}
@@ -312,7 +362,7 @@ func TestDispatchToOfflineProvider(t *testing.T) {
 	s := newTestServer(t)
 	pid := register(t, s, "0.0.5005", 3)
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 10}, testBuyer)
+	w := askQuote(t, s, pid, "x", testBuyer)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("code = %d, want 503", w.Code)
 	}
@@ -327,17 +377,18 @@ func TestDispatchToOfflineProvider(t *testing.T) {
 func TestPolicyDeniesBeforeAnyWork(t *testing.T) {
 	s := newTestServer(t)
 	ran := make(chan struct{}, 1)
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	over := s.limits.PerCallCapTinybar/3 + 100
+	pid, done := connectProvider(t, s, 3, quotesAt(over, func(f hub.Frame) *hub.Frame {
 		if f.Type == hub.FrameJob {
 			ran <- struct{}{}
 			return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Units: 1}
 		}
 		return nil
-	})
+	}))
 	defer done()
 
-	over := s.limits.PerCallCapTinybar/3 + 100
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": over}, testBuyer)
+	// The refusal lands at quote time now, so the provider is never asked to work at all.
+	w := askQuote(t, s, pid, "x", testBuyer)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("code = %d, want 403", w.Code)
 	}
@@ -370,18 +421,20 @@ func TestPolicyDeniesBeforeAnyWork(t *testing.T) {
 func TestJobOutlivesTheRequest(t *testing.T) {
 	s := newTestServer(t)
 	release := make(chan struct{})
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(100, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		<-release // held until after the request is long gone
 		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "done anyway", Units: 5}
-	})
+	}))
 	defer done()
+
+	quoteID := decodeBody(t, askQuote(t, s, pid, "x", testBuyer))["quote_id"].(string)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := httptest.NewRequest("POST", "/p/"+pid+"/job",
-		strings.NewReader(`{"prompt":"x","max_units":100}`)).WithContext(ctx)
+		strings.NewReader(`{"quote_id":"`+quoteID+`"}`)).WithContext(ctx)
 	r.Header.Set(buyerHeader, testBuyer)
 	w := httptest.NewRecorder()
 	s.routes().ServeHTTP(w, r)
@@ -403,23 +456,19 @@ func TestJobOutlivesTheRequest(t *testing.T) {
 // for one buyer, each landing on its own result.
 func TestConcurrentDispatchesAreIndependent(t *testing.T) {
 	s := newTestServer(t)
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(100, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: f.Prompt, Units: 1}
-	})
+	}))
 	defer done()
 
 	s.limits.VelocityCalls = 0 // the rule under test here is correlation, not rate limiting
 	ids := map[string]string{}
 	for i := range 5 {
 		prompt := strings.Repeat("ab", i+1)
-		w := dispatch(t, s, pid, map[string]any{"prompt": prompt, "max_units": 100}, testBuyer)
-		if w.Code != http.StatusAccepted {
-			t.Fatalf("dispatch %d: %d %s", i, w.Code, w.Body.String())
-		}
-		ids[decodeBody(t, w)["job_id"].(string)] = prompt
+		ids[quoteAndDispatch(t, s, pid, prompt)] = prompt
 	}
 
 	for jobID, prompt := range ids {

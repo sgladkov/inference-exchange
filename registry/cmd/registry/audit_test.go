@@ -53,12 +53,12 @@ func auditing(t *testing.T) (*server, *spyAudit) {
 // trace cannot be reviewed or disputed afterwards.
 func TestDenialsAreRecorded(t *testing.T) {
 	s, audit := auditing(t)
-	pid, done := connectProvider(t, s, 3, answerWith("r", 1))
+	over := s.limits.PerCallCapTinybar/3 + 100
+	pid, done := connectProvider(t, s, 3, answerWith("r", over))
 	defer done()
 
-	over := s.limits.PerCallCapTinybar/3 + 100
-	if w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": over}, testBuyer); w.Code != http.StatusForbidden {
-		t.Fatalf("code = %d, want 403", w.Code)
+	if w := askQuote(t, s, pid, "x", testBuyer); w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403: %s", w.Code, w.Body.String())
 	}
 
 	denials := audit.find(hcs.DecisionDeny)
@@ -69,8 +69,8 @@ func TestDenialsAreRecorded(t *testing.T) {
 	if d.Rule != "per-call-cap" {
 		t.Errorf("rule = %q", d.Rule)
 	}
-	if d.Phase != hcs.PhaseDispatch {
-		t.Errorf("phase = %q, want dispatch", d.Phase)
+	if d.Phase != hcs.PhaseQuote {
+		t.Errorf("phase = %q, want quote — a refusal now lands before any work is asked for", d.Phase)
 	}
 	if d.Buyer != testBuyer || d.PayTo == "" || d.Amount == 0 {
 		t.Errorf("record does not identify the refused payment: %+v", d)
@@ -116,10 +116,14 @@ func TestSettlementRecordSeparatesLedgerFromClaim(t *testing.T) {
 	f := newFakeFacilitator(t)
 	s.fac = x402.NewClient(f.srv.URL, 5*time.Second)
 
-	pid, done := connectProvider(t, s, 3, answerWith("the paid-for result", 5000))
+	pid, done := connectProvider(t, s, 3, quotesAt(10, func(f hub.Frame) *hub.Frame {
+		if f.Type != hub.FrameJob {
+			return nil
+		}
+		return &hub.Frame{Type: hub.FrameResult, JobID: f.JobID, Result: "the paid-for result", Units: 5000}
+	}))
 	defer done()
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 10}, testBuyer)
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
 	awaitTerminal(t, s, jobID)
 
 	c := challengeOf(t, collect(t, s, jobID, testBuyer, ""))
@@ -147,16 +151,15 @@ func TestSettlementRecordSeparatesLedgerFromClaim(t *testing.T) {
 
 func TestFailedJobIsRecorded(t *testing.T) {
 	s, audit := auditing(t)
-	pid, done := connectProvider(t, s, 3, func(f hub.Frame) *hub.Frame {
+	pid, done := connectProvider(t, s, 3, quotesAt(100, func(f hub.Frame) *hub.Frame {
 		if f.Type != hub.FrameJob {
 			return nil
 		}
 		return &hub.Frame{Type: hub.FrameFailed, JobID: f.JobID, Error: "the backend exploded"}
-	})
+	}))
 	defer done()
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
 	awaitTerminal(t, s, jobID)
 
 	failures := audit.find(hcs.DecisionFailed)
@@ -169,6 +172,11 @@ func TestFailedJobIsRecorded(t *testing.T) {
 	// Nothing settled, and the record must say so rather than leave it to inference.
 	if failures[0].Settled.Tx != "" {
 		t.Error("a failed job carries a transaction")
+	}
+	// A provider that broke is not a provider that refused. Both must exist in the log, distinctly,
+	// or reputation cannot tell "unreliable" from "picky".
+	if len(audit.find(hcs.DecisionDeclined)) != 0 {
+		t.Error("a failure was recorded as a decline")
 	}
 }
 

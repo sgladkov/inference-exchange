@@ -13,6 +13,8 @@ import { z } from 'zod';
 import {
   createClient,
   PolicyError,
+  DeclinedError,
+  QuoteError,
   ProviderError,
   UpstreamError,
   ExpiredError,
@@ -51,7 +53,15 @@ export function reply(text) {
 export function explain(e) {
   if (e instanceof PolicyError) {
     const rule = e.rule ? ` (rule: ${e.rule})` : '';
-    return `Refused by the exchange's spend policy${rule}. Do not retry this as-is — either lower max_units, pick a cheaper provider, or wait for the budget window to roll over.\n\n${e.reason}`;
+    return `Refused by the exchange's spend policy${rule}. Do not retry this as-is — either pick a cheaper provider, split the task into smaller ones, or wait for the budget window to roll over.\n\n${e.reason}`;
+  }
+  if (e instanceof DeclinedError) {
+    // Not a failure. The provider read the task and said no, which is an answer — and treating it
+    // as an error would push a caller into retrying against a provider that has already refused.
+    return `Provider ${e.providerId} declined this task. Nothing broke and nothing was charged; quote a different provider, or reduce what you are asking for.\n\n${e.reason}`;
+  }
+  if (e instanceof QuoteError) {
+    return `That quote is no longer usable — quotes expire, are single-use, and belong to the account that asked for them. Get a fresh quote and dispatch against that.\n\n${e.reason}`;
   }
   if (e instanceof ProviderError) {
     return `The provider failed this job. You were not charged. Try a different provider.\n\n${e.reason}`;
@@ -106,21 +116,64 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
   server.registerTool(
     'get_quote',
     {
-      title: 'Quote a task before buying it',
+      title: 'Price this exact task with one provider',
       description:
-        'Price a task with a named provider. This is the ceiling, not a prediction: you are charged for actual usage, which can be lower.',
+        'Ask a provider what this specific prompt would cost it. Nothing is commissioned and nothing is charged. The provider may also decline. The price is binding on the provider: if the work runs over its own estimate, it absorbs the difference.',
       inputSchema: {
         provider_id: z.string().describe('from find_providers'),
-        max_units: z.number().int().positive().describe('the most work you will pay for'),
+        prompt: z.string().describe('the exact task you intend to delegate'),
       },
     },
-    async ({ provider_id, max_units }) => {
+    async ({ provider_id, prompt }) => {
       try {
-        const q = await client.quote(provider_id, max_units);
+        const q = await client.quote(provider_id, prompt);
         return reply(
-          `Provider ${q.provider_id} charges ${q.rate_per_unit} tinybar/unit, paid to ${q.pay_to}.\n` +
-            `At most ${q.max_units} units → at most ${q.max_price_tinybar} tinybar.\n` +
-            'Actual usage is priced at collection and is often lower. The ceiling is enforced by the exchange, not by the provider.',
+          `Provider ${q.provider_id} quoted ${q.estimate_units} units → ${q.price_tinybar} tinybar ` +
+            `at ${q.rate_per_unit} tinybar/unit.\n` +
+            `quote_id ${q.quote_id}, valid until ${q.expires_at}.\n\n` +
+            'This price is the provider\'s own and is binding on it: an overrun comes out of its margin, ' +
+            'not your budget. Dispatch with delegate_task, which quotes and accepts in one step, or ' +
+            'compare_quotes first — a padded estimate is only visible next to someone else\'s.',
+        );
+      } catch (e) {
+        return reply(explain(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    'compare_quotes',
+    {
+      title: 'Price one task with several providers at once',
+      description:
+        'Ask several providers to price the same prompt and see what each said. Declines come back as answers rather than errors. This is the check on a padded estimate: nobody can see inside a provider\'s pricing, but a buyer can see what its competitors charged for the identical task.',
+      inputSchema: {
+        provider_ids: z.array(z.string()).describe('from find_providers'),
+        prompt: z.string().describe('the exact task, quoted identically by everyone'),
+      },
+    },
+    async ({ provider_ids, prompt }) => {
+      try {
+        const quotes = await client.quoteAll(provider_ids, prompt);
+        const priced = quotes
+          .filter((q) => !q.declined)
+          .sort((a, b) => a.price_tinybar - b.price_tinybar);
+        const refused = quotes.filter((q) => q.declined);
+
+        const lines = priced.map(
+          (q) =>
+            `${q.provider_id}  ${q.price_tinybar} tinybar  (${q.estimate_units} units @ ${q.rate_per_unit})  quote_id ${q.quote_id}`,
+        );
+        for (const q of refused) lines.push(`${q.provider_id}  no quote — ${q.reason}`);
+
+        if (!priced.length) {
+          return reply(`No provider quoted this task.\n\n${lines.join('\n')}`);
+        }
+        return reply(
+          `${priced.length} quote(s), cheapest first:\n\n${lines.join('\n')}\n\n` +
+            `Cheapest is ${priced[0].provider_id} at ${priced[0].price_tinybar} tinybar. ` +
+            'Price is not quality: a low quote from a provider with no record is a bet, and a provider ' +
+            'that declines is telling you something about the task rather than failing at it.',
         );
       } catch (e) {
         return reply(explain(e));
@@ -133,15 +186,10 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
     {
       title: 'Delegate a task and pay for the result',
       description:
-        'Send a task to a provider, wait for it, and pay for the result in HBAR on Hedera. Blocks until done. You are only charged if work is delivered — a failed job costs nothing.',
+        'Send a task to a provider, wait for it, and pay for the result in HBAR on Hedera. Blocks until done. It quotes first and accepts that quote, so the price is agreed before any work starts; use get_quote or compare_quotes if you want to see the price before committing. You are only charged if work is delivered — a failed or declined job costs nothing.',
       inputSchema: {
         provider_id: z.string().describe('from find_providers'),
         prompt: z.string().describe('the task to delegate'),
-        max_units: z
-          .number()
-          .int()
-          .positive()
-          .describe('spending ceiling in units; the exchange enforces it against the provider'),
         wait_seconds: z
           .number()
           .int()
@@ -150,7 +198,7 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
           .describe('how long to wait before handing back a job id (default 600)'),
       },
     },
-    async ({ provider_id, prompt, max_units, wait_seconds }, extra) => {
+    async ({ provider_id, prompt, wait_seconds }, extra) => {
       // Progress notifications need a token from the caller; without one they are simply not sent.
       const token = extra?._meta?.progressToken;
       const notify = async (message, progress) => {
@@ -167,12 +215,17 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
 
       try {
         let lastNotified = 0;
+        let quoted = null;
         const out = await client.delegate(
           provider_id,
           prompt,
-          max_units,
           (e) => {
-            if (e.phase === 'dispatching') return void notify('dispatching to the provider', 0);
+            if (e.phase === 'quoting') return void notify('asking the provider for a price', 0);
+            if (e.phase === 'quoted') {
+              quoted = e;
+              return void notify(`quoted ${e.price} tinybar for ${e.units} units`, 0);
+            }
+            if (e.phase === 'dispatching') return void notify('dispatching at the agreed price', 0);
             if (e.phase === 'running') {
               const secs = Math.round(e.elapsed_ms / 1000);
               // Throttle: polling is per-second but a notification per second is noise.
@@ -186,12 +239,16 @@ export function buildServer(client, { name = 'inference-exchange', version = '0.
           { timeoutMs: (wait_seconds ?? 600) * 1000 },
         );
 
+        // Worth saying out loud: this is the case the binding quote exists for. The provider needed
+        // more work than it priced, and the difference came out of its margin rather than the buyer's.
         const clamped =
           out.reported_units > out.priced_units
-            ? `\n\nNote: the provider reported ${out.reported_units} units but you were charged for ${out.priced_units} — your ceiling held.`
+            ? `\n\nNote: the provider used ${out.reported_units} units but quoted ${out.priced_units}, ` +
+              'so you paid the quoted price and it absorbed the overrun.'
             : '';
+        const agreed = quoted ? `Quoted ${quoted.price} tinybar for ${quoted.units} units.\n` : '';
         return reply(
-          `${out.result}\n\n---\nPaid ${out.price_tinybar} tinybar for ${out.priced_units} units.\n` +
+          `${out.result}\n\n---\n${agreed}Paid ${out.price_tinybar} tinybar for ${out.priced_units} units.\n` +
             `Settled on Hedera testnet: ${out.tx_id}\n` +
             `https://hashscan.io/testnet/transaction/${out.tx_id}${clamped}`,
         );

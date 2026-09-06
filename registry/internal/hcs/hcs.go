@@ -29,12 +29,16 @@ const (
 	DecisionDeny    = "DENY"
 	DecisionSettled = "SETTLED"
 	DecisionFailed  = "FAILED"
+	// A provider refused work at quote time. Recorded because it is a decision someone made about a
+	// buyer, but it is the provider's decision, not the exchange's policy.
+	DecisionDeclined = "DECLINED"
 )
 
 // Phases a decision can be made at. The same job is judged twice — once against the buyer's
 // declared ceiling, once against the price the work actually came to — and the two are separate
 // decisions with separate records.
 const (
+	PhaseQuote    = "quote"
 	PhaseDispatch = "dispatch"
 	PhaseCollect  = "collect"
 )

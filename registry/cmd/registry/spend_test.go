@@ -29,8 +29,7 @@ func buyAndSettle(t *testing.T, s *server, units int64) int64 {
 	pid, done := connectProvider(t, s, 3, answerWith("result", units))
 	t.Cleanup(done)
 
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	jobID := decodeBody(t, w)["job_id"].(string)
+	jobID := quoteAndDispatch(t, s, pid, "x")
 	st := awaitTerminal(t, s, jobID)
 
 	c := challengeOf(t, collect(t, s, jobID, testBuyer, ""))
@@ -80,8 +79,7 @@ func TestSpendCountsOnlySettledJobs(t *testing.T) {
 	// A second job that completes but is never paid for.
 	pid, done := connectProvider(t, s, 3, answerWith("result", 10))
 	defer done()
-	w := dispatch(t, s, pid, map[string]any{"prompt": "x", "max_units": 100}, testBuyer)
-	awaitTerminal(t, s, decodeBody(t, w)["job_id"].(string))
+	awaitTerminal(t, s, quoteAndDispatch(t, s, pid, "x"))
 
 	b := spendOf(t, s, testBuyer)
 	day := b["day"].(map[string]any)
