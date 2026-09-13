@@ -352,7 +352,7 @@ question and used 10,397. Settled
 - **Testnet only.** The facilitator advertises no `hedera:mainnet` kind.
 - **No marketplace fee.** The exact scheme rejects a third credited party
   (`invalid_exact_hedera_payload_extra_positive_transfers`), so a fee would have to be out of band.
-```
+
 
 ## Next steps
 
