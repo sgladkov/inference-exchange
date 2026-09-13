@@ -39,6 +39,9 @@ What that buys, and what it costs:
 
 ## Architecture
 
+Component layout, trust boundaries and the reasoning behind the three shaping decisions are in
+**[ARCHITECTURE.md](ARCHITECTURE.md)**. The short version:
+
 ```
 buyer: agent + client (JS)              seller: provider daemon (JS)
    │ delegate()                                │ dials out (WS), never listens
