@@ -353,3 +353,59 @@ question and used 10,397. Settled
 - **No marketplace fee.** The exact scheme rejects a third credited party
   (`invalid_exact_hedera_payload_extra_positive_transfers`), so a fee would have to be out of band.
 ```
+
+## Next steps
+
+Roughly in the order they would be built, because each one makes the next cheaper.
+
+**Two-sided reputation.** The single biggest gap. A binding quote stops a provider billing past what
+it agreed to, but the agreement is still the provider's own number — so the remaining attack is to
+pad the estimate and report up to it, and competition is currently the only check. The fix is to
+publish what actually happened, as an `observed` block beside `declared`:
+
+```jsonc
+{ "declared": { "backend": "claude-code", "model": "opus" },   // the provider's word
+  "observed": { "jobs": 47, "failure_rate": 0.04, "declined": 3,
+                "quote_accuracy_median": 0.82, "over_quoted_rate": 0.15,
+                "units_p95": 29000, "median_latency_ms": 8200, "distinct_buyers": 6 } }
+```
+
+Buyers get a record too — quotes requested versus accepted, abandonment, settled spend — and
+providers can set a `min_buyer_jobs` floor before they will quote. Buyer reputation survives the
+Sybil objection that sinks most such schemes, for a specific reason: **a buyer's history can only be
+built by spending money**, so a fresh alias defeats the point of the attack it would be evading.
+Providers are the harder side, and are bounded rather than solved — by the buyer's daily budget,
+which is identity-independent.
+
+Cold start is a real cost here, so `min_buyer_jobs` defaults to 0: a tool providers may reach for,
+not a barrier the exchange imposes.
+
+**Registry state persistence.** Everything is in memory today. Nothing is custodial, so a restart
+costs at most the jobs in flight and never a settlement — but it also means reputation cannot
+accumulate, which is why this comes second rather than first. `internal/store` is the only package
+that changes; no interface moves.
+
+**Buyer-side agent skills.** Right now a human decides what to outsource. The interesting version is
+an agent Skill that decides for itself: recognising that a task is bulk, mechanical or outside its
+own context and worth farming out, choosing a tier against a budget, and splitting a large job
+across several providers. Delegation becomes a capability the agent reaches for rather than a thing
+its operator scripts.
+
+**Model-assisted quoting.** Arithmetic knows the token floor and the input length exactly. What it
+cannot judge is how much work an *answer* needs — "write a haiku" and "analyse this design" differ
+enormously and only semantics separates them. A short sizing call to a small model would close that,
+priced in fractions of a cent. It must go to the Messages API directly rather than through a
+headless agent, whose ~10,000-token context floor would cost nearly as much as the job.
+
+**Hardening.** `Cache-Control: no-store` on paid results, retention pruning in `Sweep`, request body
+and prompt caps, per-IP limits on registration and connect, and per-buyer quote quotas — quoting is
+free to the buyer but costs the provider something, which is an asymmetry worth bounding. Plus a
+written threat model, per party, marking each risk mitigated, bounded, or accepted.
+
+**A2A binding.** An agent card at `/.well-known/agent-card.json` declaring the
+[x402 extension](https://github.com/google-agentic-commerce/a2a-x402), and a `/a2a` endpoint mapping
+`message/send` onto the existing quote and collect path. Cheap now that quoting exists, since the
+extension's `input-required` + `payment-required` shape is what the quote already is.
+
+**Mainnet**, when a facilitator advertises a `hedera:mainnet` kind. Nothing in the design is
+testnet-specific; the network is configuration.
