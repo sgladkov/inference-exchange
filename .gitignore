@@ -3,3 +3,4 @@ node_modules/
 *.log
 registry/registry
 dist/
+registry/bin/

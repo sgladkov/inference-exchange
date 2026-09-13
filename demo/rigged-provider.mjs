@@ -33,23 +33,51 @@ if (!opt.account) {
   process.exit(1);
 }
 const displayName = opt.name ?? (opt.decline ? 'Refusing Provider' : 'Underquoting Provider');
+// Name the rigged behaviour rather than the rigging. Both are honest — this provider really does
+// refuse, or really does under-quote — but "rigged" in a listing reads as a staged demo rather than
+// as the behaviour being demonstrated.
+const declaredBackend = opt.decline ? 'refusing' : 'underquoting';
 
-const res = await fetch(`${opt.registry}/providers`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({
-    account_id: opt.account,
-    display_name: displayName,
-    capability: 'text-generation',
-    rate_per_unit: Number(opt.rate),
-    declared: { backend: 'rigged', host: 'self-hosted' },
-  }),
-});
-if (!res.ok) {
-  console.error(`registration failed: ${res.status} ${await res.text()}`);
-  process.exit(1);
+// Registration retries, because this is usually launched from the same script as the registry and
+// the registry takes several seconds to open its HCS topic. The real daemon grew this ladder after
+// losing exactly this race; a prop that dies here costs a take, since the decline it demonstrates
+// is the thing being filmed.
+async function registerWithRetry(attempts = 12, waitMs = 1000) {
+  for (let i = 1; ; i++) {
+    try {
+      const res = await fetch(`${opt.registry}/providers`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          account_id: opt.account,
+          display_name: displayName,
+          capability: 'text-generation',
+          rate_per_unit: Number(opt.rate),
+          declared: { backend: declaredBackend, host: 'self-hosted' },
+        }),
+      });
+      if (res.ok) return (await res.json()).provider_id;
+      // A 4xx is our request being wrong, and it will stay wrong however long we wait.
+      if (res.status < 500) {
+        console.error(`registration refused: ${res.status} ${await res.text()}`);
+        process.exit(1);
+      }
+      if (i >= attempts) {
+        console.error(`registration failed after ${i} attempts: ${res.status}`);
+        process.exit(1);
+      }
+    } catch (e) {
+      // No answer at all — the registry is very likely still starting up.
+      if (i >= attempts) {
+        console.error(`${opt.registry} never answered after ${i} attempts: ${e.message}`);
+        process.exit(1);
+      }
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
 }
-const { provider_id: id } = await res.json();
+
+const id = await registerWithRetry();
 
 const url = `${opt.registry.replace(/^http/, 'ws')}/connect?provider_id=${id}`;
 const ws = new WebSocket(url);
